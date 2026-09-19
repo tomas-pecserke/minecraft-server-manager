@@ -106,26 +106,26 @@ test('compatWarnings flags loader family and version differences', () => {
   );
 });
 
-test('serverWorldDims includes split dims that exist on disk', () => {
+test('serverWorldDims includes split dims that exist on disk', async () => {
   const sid = app.seedServer('wdims');
   const base = dataPath('servers', sid);
   fs.mkdirSync(path.join(base, 'world'), { recursive: true });
   fs.mkdirSync(path.join(base, 'world_nether'), { recursive: true });
-  const dims = worlds.serverWorldDims(sid, 'world');
+  const dims = await worlds.serverWorldDims(sid, 'world');
   assert.equal(dims.length, 2);
-  assert.ok(dims.includes(dataPath('servers', sid, 'world_nether')));
+  assert.ok(dims.includes('world_nether'));
 });
 
-test('activeLevelName prefers LEVEL env, then server.properties, then world', () => {
+test('activeLevelName prefers LEVEL env, then server.properties, then world', async () => {
   const sid = app.seedServer('wact');
   const base = dataPath('servers', sid);
   fs.mkdirSync(base, { recursive: true });
   // no server.properties -> 'world'
-  const plain = worlds.activeLevelName({ id: sid, env: {} });
+  const plain = await worlds.activeLevelName({ id: sid, env: {} });
   assert.equal(plain, 'world');
 
   // with LEVEL env
-  assert.equal(worlds.activeLevelName({ id: sid, env: { LEVEL: 'myworld' } }), 'myworld');
+  assert.equal(await worlds.activeLevelName({ id: sid, env: { LEVEL: 'myworld' } }), 'myworld');
 });
 
 test('listServerWorlds marks active world, sizes dims, and reads seed', async () => {
@@ -153,6 +153,38 @@ test('listServerWorlds marks active world, sizes dims, and reads seed', async ()
   assert.deepEqual(await worlds.listServerWorlds(emptySid), []);
   // an unknown server -> 404
   await assert.rejects(() => worlds.listServerWorlds('missing-server'), /Server not found/);
+});
+
+test('listServerWorlds can size from the storage index, and holds the listing briefly', async () => {
+  const sid = app.seedServer('wsized');
+  const base = dataPath('servers', sid);
+  fs.mkdirSync(path.join(base, 'world_nether'), { recursive: true });
+  writeLevel(path.join(base, 'world', 'level.dat'));
+  fs.writeFileSync(path.join(base, 'world', 'data.bin'), Buffer.alloc(100));
+  fs.writeFileSync(path.join(base, 'world_nether', 'data.bin'), Buffer.alloc(50));
+  for (const [rel, size] of [
+    [`servers/${sid}/world`, 4096],
+    [`servers/${sid}/world_nether`, 2048],
+  ]) {
+    db.run(
+      "INSERT INTO storage_index (rel_path, size_bytes, file_count, scanned_at) VALUES (?, ?, 1, datetime('now'))",
+      rel,
+      size
+    );
+  }
+
+  const [live] = await worlds.listServerWorlds(sid);
+  assert.equal(live.sizeBytes, 150, 'the live listing measures the world dirs themselves');
+  const [indexed] = await worlds.listServerWorlds(sid, { sizes: 'index' });
+  assert.equal(indexed.sizeBytes, 6144, 'the index answers with what the last scan recorded');
+  assert.deepEqual(indexed.dims, live.dims, 'both modes find the same worlds');
+
+  // The cached listing survives a change on disk; anything that changes a world
+  // drops it, and forgetWorlds is what those operations call.
+  fs.writeFileSync(path.join(base, 'world', 'more.bin'), Buffer.alloc(900));
+  assert.equal((await worlds.listServerWorlds(sid))[0].sizeBytes, 150, 'a repeat read comes from the cache');
+  worlds.forgetWorlds(sid);
+  assert.equal((await worlds.listServerWorlds(sid))[0].sizeBytes, 1050, 'and a dropped cache measures again');
 });
 
 test('libraryWorlds maps rows and deleteLibraryWorld 404s/deletes', async () => {
@@ -207,7 +239,7 @@ test('installWarnings and copyWarnings 404 on missing inputs', async () => {
   try {
     assert.throws(() => worlds.installWarnings('lib_missing', 'srv_abc'), /World not found in the library/);
     assert.throws(() => worlds.installWarnings('lib_404', 'not-a-server'), /Server not found/);
-    assert.throws(() => worlds.copyWarnings('not-a-server', 'srv_abc'), /Server not found/);
+    await assert.rejects(() => worlds.copyWarnings('not-a-server', 'srv_abc'), /Server not found/);
   } finally {
     db.run('DELETE FROM library_files WHERE id = ?', 'lib_404');
   }

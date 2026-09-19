@@ -376,20 +376,20 @@ async function whisper(serverId, player, message) {
   }
 }
 
-function isOp(serverId, player) {
+async function isOp(serverId, player) {
   const lower = player.toLowerCase();
-  return players.readJson(serverId, 'ops.json').some((e) => (e.name || '').toLowerCase() === lower);
+  return (await players.readJson(serverId, 'ops.json')).some((e) => (e.name || '').toLowerCase() === lower);
 }
 
-function isWhitelisted(serverId, player) {
+async function isWhitelisted(serverId, player) {
   const lower = player.toLowerCase();
   return (
-    players.readJson(serverId, 'whitelist.json').some((e) => (e.name || '').toLowerCase() === lower) ||
-    isOp(serverId, player)
+    (await players.readJson(serverId, 'whitelist.json')).some((e) => (e.name || '').toLowerCase() === lower) ||
+    (await isOp(serverId, player))
   );
 }
 
-function hasPermission(serverId, player, permission) {
+async function hasPermission(serverId, player, permission) {
   if (permission === 'ops') return isOp(serverId, player);
   if (permission === 'whitelist') return isWhitelisted(serverId, player);
   return true;
@@ -509,7 +509,7 @@ async function handleChat(serverId, player, message) {
   pruneCooldowns();
 
   // Permission
-  if (!hasPermission(serverId, player, cmd.permission)) {
+  if (!(await hasPermission(serverId, player, cmd.permission))) {
     whisper(serverId, player, "You don't have permission to use that.");
     recordEvent({
       serverId,

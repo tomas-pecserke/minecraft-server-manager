@@ -19,6 +19,7 @@ const tasks = require('../../services/tasks');
 const db = require('../../db');
 const eventsService = require('../../events');
 const { dataPath } = require('../../storage/pathGuard');
+const serverFs = require('../../storage/serverFs');
 const { checkDocker } = require('../../docker/connect');
 const { fetchLogs } = require('../../docker/logs');
 const { statsOnce } = require('../../docker/stats');
@@ -1821,7 +1822,7 @@ router.get(
   '/servers/:id/pending-downloads',
   asyncHandler(async (req, res, next) => {
     requireServer(req.params.id);
-    res.json({ ok: true, mods: mods.pendingDownloads(req.params.id) });
+    res.json({ ok: true, mods: await mods.pendingDownloads(req.params.id) });
   })
 );
 
@@ -1830,10 +1831,10 @@ router.post(
   asyncHandler(async (req, res, next) => {
     requireServer(req.params.id);
     const { filename } = z.object({ filename: z.string().min(1).max(300) }).parse(req.body);
-    const token = mods.pendingExcludeToken(req.params.id, filename);
+    const token = await mods.pendingExcludeToken(req.params.id, filename);
     mods.excludePackMod(req.params.id, token, { actor: req.user.username });
-    mods.clearPendingLine(req.params.id, filename);
-    res.json({ ok: true, excluded: token, mods: mods.pendingDownloads(req.params.id) });
+    await mods.clearPendingLine(req.params.id, filename);
+    res.json({ ok: true, excluded: token, mods: await mods.pendingDownloads(req.params.id) });
   })
 );
 
@@ -1844,14 +1845,14 @@ router.post(
     requireServer(req.params.id);
     if (!req.file) throw Object.assign(new Error('No file uploaded'), { status: 400 });
     const excludeFilename = (req.body && req.body.excludeFilename) || null;
-    const excludeToken = excludeFilename ? mods.pendingExcludeToken(req.params.id, excludeFilename) : null;
+    const excludeToken = excludeFilename ? await mods.pendingExcludeToken(req.params.id, excludeFilename) : null;
     try {
       const result = await mods.importUploadedMod(req.params.id, req.file.path, req.file.originalname, {
         excludeToken,
         actor: req.user.username,
       });
-      if (excludeFilename) mods.clearPendingLine(req.params.id, excludeFilename);
-      res.status(201).json({ ok: true, ...result, mods: mods.pendingDownloads(req.params.id) });
+      if (excludeFilename) await mods.clearPendingLine(req.params.id, excludeFilename);
+      res.status(201).json({ ok: true, ...result, mods: await mods.pendingDownloads(req.params.id) });
     } finally {
       fs.promises.rm(req.file.path, { force: true }).catch((e) => {
         logger.debug('Could not remove a temporary upload file.', {
@@ -2038,13 +2039,17 @@ router.get(
 const gameLogFileSchema = z.string().regex(/^[\w.-]+\.log(\.gz)?$/, 'Invalid log file name');
 
 async function listGameLogs(serverId) {
-  const dir = dataPath('servers', serverId, 'logs');
-  const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
+  const entries = await serverFs
+    .for(serverId)
+    .readdir('logs')
+    .catch(() => []);
   const out = [];
   for (const e of entries) {
-    if (!e.isFile() || !/\.log(\.gz)?$/.test(e.name)) continue;
-    const st = await fsp.stat(path.join(dir, e.name)).catch(() => null);
-    if (st) out.push({ file: e.name, size: st.size, mtimeMs: st.mtimeMs });
+    if (e.dir || !/\.log(\.gz)?$/.test(e.name)) continue;
+    // The listing already carries size and mtime, so there is no second stat
+    // per file - which on a server whose files live on the Docker host would be
+    // a round trip each.
+    out.push({ file: e.name, size: e.size, mtimeMs: e.mtimeMs });
   }
   // latest.log first, then newest-rotated first.
   out.sort((a, b) => (a.file === 'latest.log' ? -1 : b.file === 'latest.log' ? 1 : b.mtimeMs - a.mtimeMs));
@@ -2061,12 +2066,17 @@ router.get(
 
 router.get(
   '/servers/:id/logs/game/:file',
-  asyncHandler((req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     requireServer(req.params.id);
     const file = gameLogFileSchema.parse(req.params.file);
-    const abs = dataPath('servers', req.params.id, 'logs', file);
-    if (!fs.existsSync(abs)) throw Object.assign(new Error('Log file not found'), { status: 404 });
-    res.download(abs, file);
+    const handle = serverFs.for(req.params.id);
+    const st = await handle.statOrNull(`logs/${file}`);
+    if (!st) throw Object.assign(new Error('Log file not found'), { status: 404 });
+    res.setHeader('Content-Length', String(st.size));
+    res.attachment(file);
+    const stream = await handle.readStream(`logs/${file}`);
+    stream.on('error', next);
+    stream.pipe(res);
   })
 );
 
@@ -2077,7 +2087,7 @@ router.get(
   '/servers/:id/logs/bundle.zip',
   asyncHandler(async (req, res, next) => {
     const server = requireServer(req.params.id);
-    const dir = dataPath('servers', req.params.id, 'logs');
+    const handle = serverFs.for(req.params.id);
     const list = await listGameLogs(req.params.id);
     if (!list.length) throw Object.assign(new Error('This server has no log files yet'), { status: 404 });
     const total = list.reduce((n, f) => n + f.size, 0);
@@ -2096,7 +2106,7 @@ router.get(
       res.status(500).end();
     });
     zip.pipe(res);
-    for (const f of list) zip.file(path.join(dir, f.file), { name: f.file });
+    for (const f of list) zip.append(await handle.readStream(`logs/${f.file}`), { name: f.file });
     zip.finalize();
   })
 );

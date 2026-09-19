@@ -89,8 +89,11 @@ function makeRouter(scope) {
     '/download',
     asyncHandler(async (req, res, next) => {
       const rel = pathSchema.parse(req.query.path ?? '');
-      const file = await files.statFile(sid(req), rel);
-      res.download(file.abs, file.name);
+      const file = await files.openDownload(sid(req), rel);
+      res.setHeader('Content-Length', String(file.size));
+      res.attachment(file.name);
+      file.stream.on('error', next);
+      file.stream.pipe(res);
     })
   );
 

@@ -120,14 +120,10 @@ router.get(
   '/',
   asyncHandler(async (req, res, next) => {
     const { server, ctx } = await loadContext(req);
-    const onlineNames = ctx.running ? await players.listOnlineNames(server.id) : [];
-    res.json({
-      ok: true,
-      running: ctx.running,
-      players: players.listPlayers(server.id, onlineNames),
-      bannedIps: players.listBannedIps(server.id),
-      whitelistEnforced: players.getWhitelistEnforced(server.id),
-    });
+    const onlineNames = ctx.running ? await players.onlineNames(server.id) : [];
+    // One read of the server's player files covers the whole response.
+    const { players: roster, bannedIps, whitelistEnforced } = await players.rosterView(server.id, onlineNames);
+    res.json({ ok: true, running: ctx.running, players: roster, bannedIps, whitelistEnforced });
   })
 );
 

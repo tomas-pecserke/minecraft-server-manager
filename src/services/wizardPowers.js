@@ -1,11 +1,10 @@
 // @ts-nocheck -- OpenAI-compatible tool-call payloads vary between providers.
 'use strict';
 
-const fsp = require('node:fs/promises');
 const nbt = require('prismarine-nbt');
 const httpError = require('../utils/httpError');
 const { PLAYER_NAME_RE } = require('../utils/playerName');
-const { dataPath } = require('../storage/pathGuard');
+const serverFs = require('../storage/serverFs');
 const { execCapture, inspectStatus } = require('../docker/containers');
 const { cleanText } = require('../utils/ansi');
 const { recordEvent, listEvents } = require('../events');
@@ -351,9 +350,9 @@ async function fixedRcon(serverId, args, player) {
 async function worldSpawn(serverId) {
   const server = servers.getServer(serverId);
   if (!server) throw httpError(404, 'Server not found');
-  const file = dataPath('servers', serverId, worlds.activeLevelName(server), 'level.dat');
+  const level = await worlds.activeLevelName(server);
   try {
-    const { parsed } = await nbt.parse(await fsp.readFile(file));
+    const { parsed } = await nbt.parse(await serverFs.for(serverId).readFile(`${level}/level.dat`));
     const data = nbt.simplify(parsed).Data || nbt.simplify(parsed);
     const x = Number(data.SpawnX);
     const z = Number(data.SpawnZ);

@@ -15,7 +15,8 @@ const Docker = require('dockerode');
 let client = null;
 
 function detectOptions() {
-  if (process.env.DOCKER_HOST) return {}; // dockerode reads DOCKER_HOST itself
+  const dockerHost = (process.env.DOCKER_HOST || '').trim();
+  if (dockerHost) return {}; // dockerode reads DOCKER_HOST itself
   if (process.platform === 'win32') return { socketPath: '//./pipe/docker_engine' };
   // Prefer the classic system socket, but recent Docker Desktop (macOS) and
   // rootless Docker/Podman only expose a per-user socket - probe those too so a

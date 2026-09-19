@@ -123,7 +123,7 @@ async function runCleanup(action, { olderThanDays, dryRun = false, actor = 'syst
       const crashes = require('../../crashes');
       const owners = db.all('SELECT DISTINCT server_id FROM crash_reports WHERE file_mtime < ?', cutoffIso);
       for (const { server_id: sid } of owners) {
-        const result = crashes.deleteOlderThan(sid, days, { actor });
+        const result = await crashes.deleteOlderThan(sid, days, { actor });
         removed += result.deleted;
         freedBytes += result.freedBytes;
       }

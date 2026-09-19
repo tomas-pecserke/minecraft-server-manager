@@ -3,13 +3,12 @@
 // Crash-report service: watches each server's crash-reports/ dir (plus JVM
 // hs_err_pid*.log files in the server root), indexes new reports in SQLite
 // with a parsed one-line summary + suspected mods, and links each to a
-// history event. All filesystem access goes through pathGuard.
+// history event. All filesystem access goes through serverFs, so it works the
+// same whether the server's files are here or on another Docker host.
 
-const fs = require('node:fs');
-const fsp = fs.promises;
 const { nanoid } = require('nanoid');
 const db = require('../db');
-const { dataPath } = require('../storage/pathGuard');
+const serverFs = require('../storage/serverFs');
 const { recordEvent } = require('../events');
 const logger = require('../logger')('crashes');
 const { serializeError } = require('../utils/logSanitize');
@@ -42,11 +41,9 @@ const BORING_ROOTS = [
   'scala.',
 ];
 
-function absPathFor(serverId, filename) {
+function relPathFor(filename) {
   // hs_err files live in the server root; crash reports in crash-reports/.
-  return filename.startsWith('hs_err')
-    ? dataPath('servers', serverId, filename)
-    : dataPath('servers', serverId, 'crash-reports', filename);
+  return filename.startsWith('hs_err') ? filename : `crash-reports/${filename}`;
 }
 
 /** Parse a Minecraft crash report into { description, exception, summary, suspects }. */
@@ -158,22 +155,13 @@ function parseHsErr(text) {
 }
 
 async function listCandidateFiles(serverId) {
+  const handle = serverFs.for(serverId);
   const out = [];
-  const crashDir = dataPath('servers', serverId, 'crash-reports');
-  const rootDir = dataPath('servers', serverId);
-  try {
-    for (const name of await fsp.readdir(crashDir)) {
-      if (name.endsWith('.txt')) out.push(name);
-    }
-  } catch {
-    /* no crash-reports dir yet */
+  for (const entry of await handle.readdir('crash-reports').catch(() => [])) {
+    if (entry.name.endsWith('.txt')) out.push(entry.name);
   }
-  try {
-    for (const name of await fsp.readdir(rootDir)) {
-      if (/^hs_err_pid.*\.log$/.test(name)) out.push(name);
-    }
-  } catch {
-    /* server dir missing */
+  for (const entry of await handle.readdir('').catch(() => [])) {
+    if (/^hs_err_pid.*\.log$/.test(entry.name)) out.push(entry.name);
   }
   return out;
 }
@@ -195,12 +183,13 @@ async function listCandidateFiles(serverId) {
 const lastDirMtimes = new Map(); // serverId -> { crash: number|null, root: number|null }
 const MTIME_SETTLE_MS = 2500;
 
-function dirMtimeOrNull(abs) {
-  try {
-    return fs.statSync(abs).mtimeMs;
-  } catch {
-    return null;
-  } // dir missing / unreadable
+/** Both watched directories' mtimes in one call (one round trip when remote). */
+async function watchedDirMtimes(serverId) {
+  const [crash, root] = await serverFs
+    .for(serverId)
+    .statMany(['crash-reports', ''])
+    .catch(() => [null, null]);
+  return { crash: crash ? crash.mtimeMs : null, root: root ? root.mtimeMs : null };
 }
 
 /** The value to remember for a dir: its mtime once it has settled, else undefined (= "check again"). */
@@ -212,20 +201,18 @@ function settledMtime(mtime) {
 /** Scan one server for crash files not yet indexed; parse + insert + record event. */
 async function scanServer(serverId) {
   const inserted = [];
-  const dirMtimes = {
-    crash: dirMtimeOrNull(dataPath('servers', serverId, 'crash-reports')),
-    root: dirMtimeOrNull(dataPath('servers', serverId)),
-  };
+  const handle = serverFs.for(serverId);
+  const dirMtimes = await watchedDirMtimes(serverId);
   const last = lastDirMtimes.get(serverId);
   if (last && last.crash === dirMtimes.crash && last.root === dirMtimes.root) return inserted;
   for (const filename of await listCandidateFiles(serverId)) {
     if (db.get('SELECT id FROM crash_reports WHERE server_id = ? AND filename = ?', serverId, filename)) continue;
 
-    const abs = absPathFor(serverId, filename);
+    const rel = relPathFor(filename);
     let stat, text;
     try {
-      stat = await fsp.stat(abs);
-      text = await fsp.readFile(abs, 'utf8');
+      stat = await handle.stat(rel);
+      text = (await handle.readFile(rel)).toString('utf8');
     } catch {
       continue;
     } // deleted between readdir and read
@@ -238,7 +225,7 @@ async function scanServer(serverId) {
       id,
       serverId,
       filename,
-      stat.mtime.toISOString(),
+      new Date(stat.mtimeMs).toISOString(),
       stat.size,
       parsed.summary,
       parsed.exception,
@@ -340,7 +327,7 @@ async function getCrashText(serverId, filename) {
     throw err;
   }
   // Reports are 100KB+ - read async so a view never blocks the event loop.
-  return fsp.readFile(absPathFor(serverId, filename), 'utf8');
+  return (await serverFs.for(serverId).readFile(relPathFor(filename))).toString('utf8');
 }
 
 function markViewed(crashId) {
@@ -360,7 +347,7 @@ async function shareCrash(crashId, { actor = 'system' } = {}) {
     throw err;
   }
   if (row.mclogs_url) return { id: row.mclogs_id, url: row.mclogs_url, alreadyShared: true };
-  const text = await fsp.readFile(absPathFor(row.server_id, row.filename), 'utf8');
+  const text = (await serverFs.for(row.server_id).readFile(relPathFor(row.filename))).toString('utf8');
   const paste = await require('../integrations/mclogs').uploadLog(text);
   db.run('UPDATE crash_reports SET mclogs_id = ?, mclogs_url = ? WHERE id = ?', paste.id, paste.url, crashId);
   recordEvent({
@@ -392,7 +379,7 @@ async function crashInsights(crashId, { actor = 'system' } = {}) {
 }
 
 /** Delete a report: unlink the file + remove the row + record the event. */
-function deleteCrash(crashId, { actor = 'system' } = {}) {
+async function deleteCrash(crashId, { actor = 'system' } = {}) {
   const row = getCrash(crashId);
   if (!row) {
     const err = new Error('Crash report not found');
@@ -400,7 +387,7 @@ function deleteCrash(crashId, { actor = 'system' } = {}) {
     throw err;
   }
   try {
-    fs.unlinkSync(absPathFor(row.server_id, row.filename));
+    await serverFs.for(row.server_id).remove(relPathFor(row.filename));
   } catch {
     /* file already gone - still drop the row */
   }
@@ -416,12 +403,12 @@ function deleteCrash(crashId, { actor = 'system' } = {}) {
 }
 
 /** Bulk cleanup: delete this server's reports older than `days`. */
-function deleteOlderThan(serverId, days, { actor = 'system' } = {}) {
+async function deleteOlderThan(serverId, days, { actor = 'system' } = {}) {
   const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
   const rows = db.all('SELECT id FROM crash_reports WHERE server_id = ? AND file_mtime < ?', serverId, cutoff);
   let freedBytes = 0;
   for (const { id } of rows) {
-    freedBytes += deleteCrash(id, { actor }).freedBytes;
+    freedBytes += (await deleteCrash(id, { actor })).freedBytes;
   }
   return { deleted: rows.length, freedBytes };
 }

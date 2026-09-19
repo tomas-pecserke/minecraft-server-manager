@@ -17,7 +17,6 @@
 // from-mods loop. Overrides extraction is opt-in, zip-slip-guarded, and backs
 // up every file it would overwrite first (reversible by construction).
 
-const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const crypto = require('node:crypto');
 const path = require('node:path');
@@ -26,6 +25,7 @@ const { readZipIndex, forEachEntryBuffer, extractZipSafe, safeEntryName } = requ
 const { curseforgeFingerprint } = require('../utils/murmur2');
 const { recordEvent } = require('../events');
 const { dataPath } = require('../storage/pathGuard');
+const serverFs = require('../storage/serverFs');
 const curseforge = require('./curseforgeApi');
 const modrinth = require('./modrinthApi');
 const modIdentify = require('./modIdentify');
@@ -402,7 +402,7 @@ async function previewForServer(serverId, zipPath) {
   const server = serverTarget(serverId);
   const kind = modsService.contentKindOf(server);
   const serverMc = server.mc_version;
-  const serverLoader = modsService.loaderOf(server);
+  const serverLoader = await modsService.loaderOf(server);
   const info = await inspect(zipPath);
   const installed = await installedIndex(serverId);
   const judge = (identityish) => modIdentify.verdictFor(identityish, { kind, loader: serverLoader, mc: serverMc });
@@ -601,7 +601,7 @@ async function previewStandalone(zipPath) {
 async function applyOverridesTo(serverId, zipPath, overridesPrefix, { actor = 'system' } = {}) {
   serverTarget(serverId);
   const prefixes = Array.isArray(overridesPrefix) ? overridesPrefix : [overridesPrefix];
-  const serverDir = dataPath('servers', serverId);
+  const handle = serverFs.for(serverId);
   const { entries } = await readZipIndex(zipPath);
   const overrideFiles = entries.filter((e) => prefixes.some((p) => e.name.startsWith(p)) && !e.name.endsWith('/'));
   if (!overrideFiles.length) return { applied: 0, backedUp: 0, backupDir: null };
@@ -616,7 +616,6 @@ async function applyOverridesTo(serverId, zipPath, overridesPrefix, { actor = 's
   // below - path.join would use '\' on Windows and break all three.
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const backupRel = `.import-backups/${stamp}`;
-  const backupDir = path.join(serverDir, backupRel);
   let backedUp = 0;
   const backedUpRels = new Set();
   for (const e of overrideFiles) {
@@ -624,32 +623,41 @@ async function applyOverridesTo(serverId, zipPath, overridesPrefix, { actor = 's
     const rel = e.name.slice(prefix.length);
     if (!rel || backedUpRels.has(rel) || !safeEntryName(rel)) continue;
     backedUpRels.add(rel);
-    const target = path.join(serverDir, rel);
-    if (fs.existsSync(target) && fs.statSync(target).isFile()) {
-      const dest = path.join(backupDir, rel);
-      await fsp.mkdir(path.dirname(dest), { recursive: true });
-      await fsp.copyFile(target, dest);
+    const existing = await handle.statOrNull(rel);
+    if (existing && !existing.dir) {
+      // The copy happens where the files are, so nothing crosses the wire for
+      // a server on another Docker host.
+      await handle.copy(rel, `${backupRel}/${rel}`);
       backedUp += 1;
     }
   }
 
+  // Extract into a staging directory here, then hand the tree to serverFs -
+  // the zip reader needs real files, and the server's data may live elsewhere.
+  const staging = dataPath('tmp', `overrides-${Date.now().toString(36)}-${process.pid}`);
+  await fsp.mkdir(staging, { recursive: true });
   let applied = 0;
   const appliedRels = new Set();
-  for (const prefix of prefixes) {
-    await extractZipSafe(zipPath, serverDir, {
-      map: (name) => {
-        if (!name.startsWith(prefix)) return null;
-        const rel = name.slice(prefix.length);
-        if (!rel) return null;
-        // Never let overrides touch the panel's own backup tree.
-        if (rel === '.import-backups' || rel.startsWith('.import-backups/')) return null;
-        if (!name.endsWith('/') && !appliedRels.has(rel)) {
-          appliedRels.add(rel);
-          applied += 1;
-        }
-        return rel;
-      },
-    });
+  try {
+    for (const prefix of prefixes) {
+      await extractZipSafe(zipPath, staging, {
+        map: (name) => {
+          if (!name.startsWith(prefix)) return null;
+          const rel = name.slice(prefix.length);
+          if (!rel) return null;
+          // Never let overrides touch the panel's own backup tree.
+          if (rel === '.import-backups' || rel.startsWith('.import-backups/')) return null;
+          if (!name.endsWith('/') && !appliedRels.has(rel)) {
+            appliedRels.add(rel);
+            applied += 1;
+          }
+          return rel;
+        },
+      });
+    }
+    await handle.uploadDir(staging, '');
+  } finally {
+    await fsp.rm(staging, { recursive: true, force: true }).catch(() => {});
   }
   recordEvent({
     serverId,
@@ -800,10 +808,11 @@ async function importForServer(
     // Documented default (no selections): install every jar whose verdict isn't
     // wrong-* — unidentified jars stay in, but a jar known to be the wrong
     // loader/kind/MC for this server never installs implicitly.
+    const zipLoader = await modsService.loaderOf(server);
     const judge = (entry) =>
       modIdentify.verdictFor(identityByEntry.get(entry) || null, {
         kind: targetKind,
-        loader: modsService.loaderOf(server),
+        loader: zipLoader,
         mc: server.mc_version,
       });
     const wanted = selections ? new Set(selections) : null;

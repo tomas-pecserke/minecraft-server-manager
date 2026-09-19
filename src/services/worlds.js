@@ -22,6 +22,7 @@ const tar = require('tar');
 const { nanoid } = require('nanoid');
 const db = require('../db');
 const { dataPath } = require('../storage/pathGuard');
+const serverFs = require('../storage/serverFs');
 const { recordEvent } = require('../events');
 const { execCapture, inspectStatus } = require('../docker/containers');
 const { serializeError } = require('../utils/logSanitize');
@@ -289,13 +290,14 @@ async function addZipToLibrary(zipAbs, { name, actor, worldSource, worldFlavor, 
  */
 async function extractFromServer(serverId, { name = '', actor = 'system' } = {}) {
   const server = mustServer(serverId);
-  const level = activeLevelName(server);
-  const dims = serverWorldDims(serverId, level);
-  if (!fs.existsSync(path.join(dims[0], 'level.dat'))) {
+  const handle = serverFs.for(serverId);
+  const level = await activeLevelName(server);
+  const dims = await serverWorldDims(serverId, level);
+  if (!(await handle.exists(`${dims[0]}/level.dat`))) {
     throw httpError(404, `World "${level}" has no level.dat yet - start the server once so it generates the world`);
   }
 
-  const worldBytes = await dirsSize(dims);
+  const worldBytes = await serverDirsSize(serverId, dims);
   const { free } = await indexer.diskFree();
   if (free < worldBytes * 2.2) {
     throw httpError(507, `Not enough disk space to snapshot this world (~${humanBytes(worldBytes * 2.2)} needed)`);
@@ -312,15 +314,17 @@ async function extractFromServer(serverId, { name = '', actor = 'system' } = {})
       serverId,
       running,
       async () => {
+        // Pulls the files onto this machine when the server lives on another
+        // Docker host; a plain copy when they are already here.
         for (const dim of dims) {
-          await fsp.cp(dim, path.join(tmpDir, path.basename(dim)), { recursive: true });
+          await handle.downloadDir(dim, path.join(tmpDir, dim));
         }
       },
       actor
     );
 
     const mainCopy = path.join(tmpDir, level);
-    const dimCopies = dims.slice(1).map((d) => path.join(tmpDir, path.basename(d)));
+    const dimCopies = dims.slice(1).map((d) => path.join(tmpDir, d));
     await zipWorld(zipTmp, mainCopy, dimCopies);
 
     const mcVersion =
@@ -355,22 +359,32 @@ async function extractFromServer(serverId, { name = '', actor = 'system' } = {})
 /**
  * Scan a server dir for worlds (top-level dirs containing level.dat), grouping
  * Bukkit-split dims under their main world and marking the active one.
+ *
+ * `sizes` picks where the byte counts come from: 'live' measures the world
+ * dirs now (the worlds tab, where a size that just changed has to show), and
+ * 'index' reads the storage index instead, which is a DB lookup and no walk at
+ * all - right for a page that only prints the numbers (the metrics tab).
  * @returns [{name, active, dims:[names], sizeBytes, seed}]
  */
-async function listServerWorlds(serverId) {
+async function listServerWorlds(serverId, { sizes = 'live' } = {}) {
+  const cached = cachedWorlds(serverId, sizes);
+  if (cached) return cached;
   const server = mustServer(serverId);
-  const base = dataPath('servers', serverId);
-  const level = activeLevelName(server);
-  const props = readProps(serverId);
-
-  let entries;
-  try {
-    entries = await fsp.readdir(base, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-  const dirNames = new Set(entries.filter((e) => e.isDirectory()).map((e) => e.name));
-  const withLevelDat = [...dirNames].filter((n) => fs.existsSync(path.join(base, n, 'level.dat')));
+  const handle = serverFs.for(serverId);
+  // ONE call for the listing, the per-world sizes and which dirs hold a
+  // level.dat: separately that is three round trips, and against a remote
+  // daemon each one costs more than the work it asks for. server.properties
+  // (the active world and its seed) is independent, so it rides along in
+  // parallel rather than adding a round trip of its own.
+  const [props, entries] = await Promise.all([
+    readProps(serverId),
+    handle.readdirSized('', { contains: ['level.dat'], withSizes: sizes === 'live' }).catch(() => null),
+  ]);
+  const level = (server.env && server.env.LEVEL) || props.get('level-name') || 'world';
+  if (!entries) return [];
+  const dirNames = new Set(entries.filter((e) => e.dir).map((e) => e.name));
+  const liveSizes = new Map(entries.map((e) => [e.name, e.sizeBytes]));
+  const withLevelDat = entries.filter((e) => e.dir && e.contains.includes('level.dat')).map((e) => e.name);
 
   // A dir is a split dim (not its own world) when its base world also exists.
   const mains = withLevelDat.filter((n) => {
@@ -378,10 +392,13 @@ async function listServerWorlds(serverId) {
     return !(m && dirNames.has(m) && withLevelDat.includes(m));
   });
 
+  const indexer = sizes === 'index' ? require('../storage/indexer') : null;
+  const sizeOf = (dim) => (indexer ? indexer.sizeOf(`servers/${serverId}/${dim}`) : liveSizes.get(dim) || 0);
+
   const worlds = [];
   for (const main of mains) {
     const dimNames = [main, ...DIM_SUFFIXES.map((s) => main + s).filter((d) => dirNames.has(d))];
-    const sizeBytes = await dirsSize(dimNames.map((d) => path.join(base, d)));
+    const sizeBytes = dimNames.reduce((n, dim) => n + sizeOf(dim), 0);
     const active = main === level;
     worlds.push({
       name: main,
@@ -392,7 +409,33 @@ async function listServerWorlds(serverId) {
     });
   }
   worlds.sort((a, b) => b.active - a.active || a.name.localeCompare(b.name));
+  rememberWorlds(serverId, sizes, worlds);
   return worlds;
+}
+
+// The listing is what the worlds tab, the metrics tab and the worlds API all
+// ask for, and on a remote host it is a directory walk on the Docker host. Hold
+// it for a few seconds - long enough that one page render (and a reload right
+// behind it) costs one walk, short enough that nothing shows a stale world for
+// long. Every world operation in this file drops it outright, so the TTL only
+// ever covers changes made outside the panel.
+const worldsCache = new Map(); // `${serverId}|${sizes}` -> { at, worlds }
+const WORLDS_TTL_MS = 5000;
+
+function cachedWorlds(serverId, sizes) {
+  const hit = worldsCache.get(`${serverId}|${sizes}`);
+  return hit && Date.now() - hit.at < WORLDS_TTL_MS ? hit.worlds : null;
+}
+
+function rememberWorlds(serverId, sizes, worlds) {
+  worldsCache.set(`${serverId}|${sizes}`, { at: Date.now(), worlds });
+}
+
+/** Drop the cached world listing for a server (after anything that changes it). */
+function forgetWorlds(serverId) {
+  for (const key of worldsCache.keys()) {
+    if (key.startsWith(`${serverId}|`)) worldsCache.delete(key);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -456,7 +499,7 @@ async function installToServerImpl(libraryId, serverId, { mode = 'replace', newN
         'Stop the server before replacing its active world - swapping it while running would corrupt the save'
       );
     }
-    targetLevel = activeLevelName(server);
+    targetLevel = await activeLevelName(server);
     const { createBackupUnguarded } = require('./backups');
     // Already inside the 'install' op lock - the guarded form would 409 against it.
     await createBackupUnguarded(serverId, {
@@ -466,7 +509,7 @@ async function installToServerImpl(libraryId, serverId, { mode = 'replace', newN
     });
   } else {
     targetLevel = sanitizeWorldName(newName || lib.name);
-    if (fs.existsSync(dataPath('servers', serverId, targetLevel))) {
+    if (await serverFs.for(serverId).exists(targetLevel)) {
       throw httpError(409, `A world named "${targetLevel}" already exists on this server - pick another name`);
     }
   }
@@ -486,27 +529,29 @@ async function installToServerImpl(libraryId, serverId, { mode = 'replace', newN
     const mainTops = tops.filter((e) => !dimTops.includes(e));
 
     if (mode === 'replace') {
-      for (const dim of serverWorldDims(serverId, targetLevel)) {
-        replacedBytes += await dirsSize([dim]);
-        await fsp.rm(dim, { recursive: true, force: true });
+      const handle = serverFs.for(serverId);
+      for (const dim of await serverWorldDims(serverId, targetLevel)) {
+        replacedBytes += await serverDirsSize(serverId, [dim]);
+        await handle.remove(dim);
       }
     }
 
-    const mainDir = dataPath('servers', serverId, targetLevel);
-    await fsp.mkdir(mainDir, { recursive: true });
+    const handle = serverFs.for(serverId);
+    await handle.mkdir(targetLevel);
     for (const e of mainTops) {
-      await moveEntry(path.join(tmpDir, e.name), path.join(mainDir, e.name));
+      if (e.isDirectory()) await handle.uploadDir(path.join(tmpDir, e.name), `${targetLevel}/${e.name}`);
+      else await handle.uploadFile(path.join(tmpDir, e.name), `${targetLevel}/${e.name}`);
     }
     for (const e of dimTops) {
       const suffix = e.name.endsWith('_the_end') ? '_the_end' : '_nether';
-      await moveEntry(path.join(tmpDir, e.name), dataPath('servers', serverId, targetLevel + suffix));
+      await handle.uploadDir(path.join(tmpDir, e.name), targetLevel + suffix);
     }
   } finally {
     releaseReservation();
     await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 
-  const sizeBytes = await dirsSize(serverWorldDims(serverId, targetLevel));
+  const sizeBytes = await serverDirsSize(serverId, await serverWorldDims(serverId, targetLevel));
   recordEvent({
     serverId,
     actor,
@@ -515,6 +560,7 @@ async function installToServerImpl(libraryId, serverId, { mode = 'replace', newN
     details: { libraryId, mode, installedAs: targetLevel, sizeBytes, replacedBytes, warnings },
   });
   logger.info('Installed a world onto a server.', { serverId, actor, installedAs: targetLevel, mode, sizeBytes });
+  forgetWorlds(serverId);
   indexer.scheduleScan();
   return { installedAs: targetLevel, mode, warnings, sizeBytes };
 }
@@ -527,12 +573,12 @@ async function installToServerImpl(libraryId, serverId, { mode = 'replace', newN
 const installToServer = guardOp('install', installToServerImpl, (_libraryId, serverId) => serverId);
 
 /** Warnings for a server→server copy (source world flavor/version vs target). */
-function copyWarnings(sourceServerId, targetServerId) {
+async function copyWarnings(sourceServerId, targetServerId) {
   const source = mustServer(sourceServerId);
   const target = mustServer(targetServerId);
-  const level = activeLevelName(source);
+  const level = await activeLevelName(source);
   const version =
-    readLevelVersion(dataPath('servers', sourceServerId, level, 'level.dat')) ||
+    (await readServerLevelVersion(sourceServerId, level)) ||
     (source.mc_version !== 'LATEST' && source.mc_version !== 'SNAPSHOT' ? source.mc_version : null);
   return compatWarnings({ flavor: source.type, version }, target);
 }
@@ -563,6 +609,7 @@ async function copyBetweenServers(
     summary: `World copied from ${source.display_name} (${humanBytes(result.sizeBytes)}, ${mode}).`,
     details: { sourceServerId, libraryId: row.id, ...result },
   });
+  forgetWorlds(targetServerId);
   return { library: row, ...result };
 }
 
@@ -573,19 +620,20 @@ async function copyBetweenServers(
 async function duplicateWorld(serverId, worldName, { actor = 'system' } = {}) {
   const server = mustServer(serverId);
   checkWorldName(worldName);
-  const dims = serverWorldDims(serverId, worldName);
-  if (!fs.existsSync(dims[0])) throw httpError(404, `No world named "${worldName}" on this server`);
+  const handle = serverFs.for(serverId);
+  const dims = await serverWorldDims(serverId, worldName);
+  if (!(await handle.exists(dims[0]))) throw httpError(404, `No world named "${worldName}" on this server`);
 
   let copyName = `${worldName}-copy`;
-  for (let i = 2; fs.existsSync(dataPath('servers', serverId, copyName)); i++) copyName = `${worldName}-copy${i}`;
+  for (let i = 2; await handle.exists(copyName); i++) copyName = `${worldName}-copy${i}`;
 
-  const sizeBytes = await dirsSize(dims);
+  const sizeBytes = await serverDirsSize(serverId, dims);
   indexer.assertUnderQuota(server, sizeBytes);
   const { free } = await indexer.diskFree();
   if (free < sizeBytes * 1.1)
     throw httpError(507, `Not enough disk space to duplicate (~${humanBytes(sizeBytes)} needed)`);
 
-  const active = worldName === activeLevelName(server);
+  const active = worldName === (await activeLevelName(server));
   const running = active && (await isRunning(serverId));
   const releaseReservation = indexer.reserveDiskSpace(sizeBytes);
   try {
@@ -594,8 +642,7 @@ async function duplicateWorld(serverId, worldName, { actor = 'system' } = {}) {
       running,
       async () => {
         for (const dim of dims) {
-          const suffix = path.basename(dim).slice(worldName.length);
-          await fsp.cp(dim, dataPath('servers', serverId, copyName + suffix), { recursive: true });
+          await handle.copy(dim, copyName + dim.slice(worldName.length));
         }
       },
       actor
@@ -611,6 +658,7 @@ async function duplicateWorld(serverId, worldName, { actor = 'system' } = {}) {
     summary: `World "${worldName}" duplicated as "${copyName}" (${humanBytes(sizeBytes)}).`,
     details: { worldName, copyName, sizeBytes },
   });
+  forgetWorlds(serverId);
   indexer.scheduleScan();
   return { name: copyName, sizeBytes };
 }
@@ -621,19 +669,19 @@ async function renameWorldImpl(serverId, worldName, newName, { actor = 'system' 
   checkWorldName(worldName);
   const clean = sanitizeWorldName(newName);
   if (await isRunning(serverId)) throw httpError(409, 'Stop the server before renaming worlds');
-  const dims = serverWorldDims(serverId, worldName);
-  if (!fs.existsSync(dims[0])) throw httpError(404, `No world named "${worldName}" on this server`);
-  if (fs.existsSync(dataPath('servers', serverId, clean))) {
+  const handle = serverFs.for(serverId);
+  const dims = await serverWorldDims(serverId, worldName);
+  if (!(await handle.exists(dims[0]))) throw httpError(404, `No world named "${worldName}" on this server`);
+  if (await handle.exists(clean)) {
     throw httpError(409, `A world named "${clean}" already exists on this server`);
   }
 
   for (const dim of dims) {
-    const suffix = path.basename(dim).slice(worldName.length);
-    await moveEntry(dim, dataPath('servers', serverId, clean + suffix));
+    await handle.rename(dim, clean + dim.slice(worldName.length));
   }
 
-  const wasActive = worldName === activeLevelName(server);
-  if (wasActive) setActiveLevel(server, clean, { actor });
+  const wasActive = worldName === (await activeLevelName(server));
+  if (wasActive) await setActiveLevel(server, clean, { actor });
 
   recordEvent({
     serverId,
@@ -642,6 +690,7 @@ async function renameWorldImpl(serverId, worldName, newName, { actor = 'system' 
     summary: `World "${worldName}" renamed to "${clean}"${wasActive ? ' (active world - level-name updated)' : ''}.`,
     details: { from: worldName, to: clean, wasActive },
   });
+  forgetWorlds(serverId);
   return { name: clean, wasActive };
 }
 
@@ -652,12 +701,12 @@ async function activateWorldImpl(serverId, worldName, { actor = 'system' } = {})
   const server = mustServer(serverId);
   checkWorldName(worldName);
   if (await isRunning(serverId)) throw httpError(409, 'Stop the server before switching worlds');
-  if (!fs.existsSync(dataPath('servers', serverId, worldName, 'level.dat'))) {
+  if (!(await serverFs.for(serverId).exists(`${worldName}/level.dat`))) {
     throw httpError(404, `No world named "${worldName}" on this server`);
   }
-  const previous = activeLevelName(server);
+  const previous = await activeLevelName(server);
   if (previous === worldName) return { active: worldName, changed: false };
-  setActiveLevel(server, worldName, { actor });
+  await setActiveLevel(server, worldName, { actor });
   recordEvent({
     serverId,
     actor,
@@ -665,6 +714,7 @@ async function activateWorldImpl(serverId, worldName, { actor = 'system' } = {})
     summary: `Active world switched: "${previous}" → "${worldName}".`,
     details: { from: previous, to: worldName },
   });
+  forgetWorlds(serverId);
   return { active: worldName, changed: true };
 }
 
@@ -688,14 +738,15 @@ async function resetWorldImpl(
 ) {
   const server = mustServer(serverId);
   if (await isRunning(serverId)) throw httpError(409, 'Stop the server before resetting the world');
-  const level = activeLevelName(server);
-  const dims = serverWorldDims(serverId, level);
-  if (!fs.existsSync(dims[0])) throw httpError(404, `World "${level}" does not exist yet - nothing to reset`);
+  const handle = serverFs.for(serverId);
+  const level = await activeLevelName(server);
+  const dims = await serverWorldDims(serverId, level);
+  if (!(await handle.exists(dims[0]))) throw httpError(404, `World "${level}" does not exist yet - nothing to reset`);
 
   // Resolve the seed to apply (null → cleared → Minecraft picks a random one).
   let newSeed = null;
   if (seedMode === 'keep') {
-    newSeed = readProps(serverId).get('level-seed') || readLevelSeed(path.join(dims[0], 'level.dat')) || null;
+    newSeed = (await readProps(serverId)).get('level-seed') || (await readServerLevelSeed(serverId, dims[0])) || null;
   } else if (seedMode === 'custom') {
     newSeed = String(seed || '').trim() || null;
   }
@@ -711,17 +762,17 @@ async function resetWorldImpl(
     });
   }
 
-  const freedBytes = await dirsSize(dims);
-  for (const dim of dims) await fsp.rm(dim, { recursive: true, force: true });
+  const freedBytes = await serverDirsSize(serverId, dims);
+  for (const dim of dims) await handle.remove(dim);
 
   // Persist the seed in server.properties + the SEED env var (itzg applies SEED
   // to level-seed on start); world type rides on the LEVEL_TYPE env the same way.
   const env = { ...server.env };
   if (newSeed) {
-    setProp(serverId, 'level-seed', String(newSeed));
+    await setProp(serverId, 'level-seed', String(newSeed));
     env.SEED = String(newSeed);
   } else {
-    setProp(serverId, 'level-seed', '');
+    await setProp(serverId, 'level-seed', '');
     delete env.SEED;
   }
   if (applyType) env.LEVEL_TYPE = applyType;
@@ -752,6 +803,7 @@ async function resetWorldImpl(
     },
   });
   logger.info('Reset a world.', { serverId, actor, level, seedMode, freedBytes });
+  forgetWorlds(serverId);
   indexer.scheduleScan();
   return {
     level,
@@ -769,13 +821,14 @@ const resetWorld = guardOp('reset', resetWorldImpl);
 async function deleteServerWorldImpl(serverId, worldName, { actor = 'system' } = {}) {
   const server = mustServer(serverId);
   checkWorldName(worldName);
-  if (worldName === activeLevelName(server)) {
+  if (worldName === (await activeLevelName(server))) {
     throw httpError(409, 'This is the active world - activate another world first, or use Reset to regenerate it');
   }
-  const dims = serverWorldDims(serverId, worldName);
-  if (!fs.existsSync(dims[0])) throw httpError(404, `No world named "${worldName}" on this server`);
-  const freedBytes = await dirsSize(dims);
-  for (const dim of dims) await fsp.rm(dim, { recursive: true, force: true });
+  const handle = serverFs.for(serverId);
+  const dims = await serverWorldDims(serverId, worldName);
+  if (!(await handle.exists(dims[0]))) throw httpError(404, `No world named "${worldName}" on this server`);
+  const freedBytes = await serverDirsSize(serverId, dims);
+  for (const dim of dims) await handle.remove(dim);
   recordEvent({
     serverId,
     actor,
@@ -784,6 +837,7 @@ async function deleteServerWorldImpl(serverId, worldName, { actor = 'system' } =
     details: { worldName, freedBytes },
   });
   logger.info('Deleted a world from a server.', { serverId, actor, worldName, freedBytes });
+  forgetWorlds(serverId);
   indexer.scheduleScan();
   return { freedBytes };
 }
@@ -803,25 +857,46 @@ const deleteServerWorld = guardOp('delete-world', deleteServerWorldImpl);
 async function prepareWorldDownload(serverId, worldName, { actor = 'system' } = {}) {
   const server = mustServer(serverId);
   checkWorldName(worldName);
-  const dims = serverWorldDims(serverId, worldName);
-  if (!fs.existsSync(dims[0])) throw httpError(404, `No world named "${worldName}" on this server`);
+  const handle = serverFs.for(serverId);
+  const dims = await serverWorldDims(serverId, worldName);
+  if (!(await handle.exists(dims[0]))) throw httpError(404, `No world named "${worldName}" on this server`);
 
-  const sizeBytes = await dirsSize(dims);
+  const sizeBytes = await serverDirsSize(serverId, dims);
   const { free } = await indexer.diskFree();
   if (free < sizeBytes * 1.2)
     throw httpError(507, `Not enough disk space to stage the download (~${humanBytes(sizeBytes)} needed)`);
 
-  const active = worldName === activeLevelName(server);
+  const active = worldName === (await activeLevelName(server));
   const running = active && (await isRunning(serverId));
   const zipAbs = dataPath('tmp', `world-dl-${nanoid(6)}.zip`);
-  await withPausedSaves(
-    serverId,
-    running,
-    async () => {
-      await zipWorld(zipAbs, dims[0], dims.slice(1));
-    },
-    actor
-  );
+  const stagingDir = handle.remote ? dataPath('tmp', `world-dl-${nanoid(6)}`) : null;
+  try {
+    await withPausedSaves(
+      serverId,
+      running,
+      async () => {
+        if (!stagingDir)
+          return zipWorld(
+            zipAbs,
+            handle.localPath(dims[0]),
+            dims.slice(1).map((d) => handle.localPath(d))
+          );
+        // The files are on the Docker host: pull the snapshot here first, then
+        // zip it at leisure, so saves stay paused only for the transfer.
+        for (const dim of dims) await handle.downloadDir(dim, path.join(stagingDir, dim));
+      },
+      actor
+    );
+    if (stagingDir) {
+      await zipWorld(
+        zipAbs,
+        path.join(stagingDir, dims[0]),
+        dims.slice(1).map((d) => path.join(stagingDir, d))
+      );
+    }
+  } finally {
+    if (stagingDir) await fsp.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
+  }
   const size = (await fsp.stat(zipAbs)).size;
   recordEvent({
     serverId,
@@ -885,66 +960,100 @@ async function deleteLibraryWorld(id, { actor = 'system' } = {}) {
 // server.properties + level helpers
 
 /** Active level name: LEVEL env wins, then server.properties, then 'world'. */
-function activeLevelName(server) {
-  return (server.env && server.env.LEVEL) || readProps(server.id).get('level-name') || 'world';
+async function activeLevelName(server) {
+  if (server.env && server.env.LEVEL) return server.env.LEVEL;
+  return (await readProps(server.id)).get('level-name') || 'world';
+}
+
+// server.properties is read by half the server page (the active world, the
+// seed, PVP, whitelist enforcement), and on a remote host each read is a round
+// trip. It changes only when the panel or the server writes it, so hold the
+// parse for a couple of seconds - long enough to collapse one page render,
+// short enough that nothing reads a stale file.
+const propsCache = new Map(); // serverId -> { at, map }
+const PROPS_TTL_MS = 2000;
+
+/** Drop the cached server.properties for a server (after a write). */
+function forgetProps(serverId) {
+  propsCache.delete(serverId);
 }
 
 /** Parse server.properties into a Map (empty when missing). */
-function readProps(serverId) {
+async function readProps(serverId) {
+  const hit = propsCache.get(serverId);
+  if (hit && Date.now() - hit.at < PROPS_TTL_MS) return hit.map;
   const map = new Map();
-  try {
-    const text = fs.readFileSync(dataPath('servers', serverId, 'server.properties'), 'utf8');
-    for (const line of text.split(/\r?\n/)) {
-      if (!line || line.startsWith('#')) continue;
-      const eq = line.indexOf('=');
-      if (eq > 0) map.set(line.slice(0, eq).trim(), line.slice(eq + 1).trim());
-    }
-  } catch {
-    /* fresh server */
+  const text = await serverFs.for(serverId).readText('server.properties');
+  for (const line of (text || '').split(/\r?\n/)) {
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq > 0) map.set(line.slice(0, eq).trim(), line.slice(eq + 1).trim());
   }
+  propsCache.set(serverId, { at: Date.now(), map });
   return map;
 }
 
 /** Set one server.properties key atomically (create the file when missing). */
-function setProp(serverId, key, value) {
-  const file = dataPath('servers', serverId, 'server.properties');
-  let text = '';
-  try {
-    text = fs.readFileSync(file, 'utf8');
-  } catch {
-    /* create fresh */
-  }
+async function setProp(serverId, key, value) {
+  const handle = serverFs.for(serverId);
+  const text = (await handle.readText('server.properties')) || '';
   const re = new RegExp(`^${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=.*$`, 'm');
-  if (re.test(text)) text = text.replace(re, `${key}=${value}`);
-  else text += `${text && !text.endsWith('\n') ? '\n' : ''}${key}=${value}\n`;
-  const tmp = dataPath('servers', serverId, 'server.properties.tmp');
-  fs.mkdirSync(dataPath('servers', serverId), { recursive: true });
-  fs.writeFileSync(tmp, text);
-  fs.renameSync(tmp, file);
+  const next = re.test(text)
+    ? text.replace(re, `${key}=${value}`)
+    : `${text}${text && !text.endsWith('\n') ? '\n' : ''}${key}=${value}\n`;
+  // Write beside the file and rename over it, so an interrupted write can never
+  // leave the server with half a properties file.
+  await handle.writeFile('server.properties.tmp', next);
+  await handle.rename('server.properties.tmp', 'server.properties');
+  forgetProps(serverId);
 }
 
 /** Point the server at a new level: property always, LEVEL env when present. */
-function setActiveLevel(server, levelName, { actor }) {
-  setProp(server.id, 'level-name', levelName);
+async function setActiveLevel(server, levelName, { actor }) {
+  await setProp(server.id, 'level-name', levelName);
   if (server.env && server.env.LEVEL !== undefined) {
     require('./servers').updateServer(server.id, { env: { ...server.env, LEVEL: levelName } }, { actor });
   }
   // Keep BlueMap (if enabled) pointed at whichever world is actually active -
   // otherwise a rename/switch after enabling the map silently breaks it again.
   const mapService = require('./map');
-  if (mapService.getMapConfig(server.id).enabled) mapService.writeMapConfigs(server.id);
+  if (mapService.getMapConfig(server.id).enabled) await mapService.writeMapConfigs(server.id);
 }
 
-/** Existing dim dirs for a world: [main, main_nether?, main_the_end?] (absolute). */
-function serverWorldDims(serverId, worldName) {
-  const main = dataPath('servers', serverId, worldName);
-  const dims = [main];
+/** Existing dim dirs for a world: [main, main_nether?, main_the_end?] (relative names). */
+async function serverWorldDims(serverId, worldName) {
+  const handle = serverFs.for(serverId);
+  const dims = [worldName];
   for (const suffix of DIM_SUFFIXES) {
-    const sibling = dataPath('servers', serverId, worldName + suffix);
-    if (fs.existsSync(sibling)) dims.push(sibling);
+    if (await handle.exists(worldName + suffix)) dims.push(worldName + suffix);
   }
   return dims;
 }
+
+/** Total bytes of a set of a server's world dirs, wherever those files live. */
+async function serverDirsSize(serverId, dims) {
+  const handle = serverFs.for(serverId);
+  let total = 0;
+  for (const dim of dims) total += (await handle.du(dim)).size;
+  return total;
+}
+
+/**
+ * Run one of the level.dat readers against a world on a server. The readers
+ * parse raw NBT from a file path, so a server whose files are on the Docker
+ * host gets a temp copy of just that one file - level.dat is a few KB.
+ */
+async function readServerLevel(serverId, worldName, reader) {
+  try {
+    return await serverFs.for(serverId).withLocalCopy(`${worldName}/level.dat`, (abs) => reader(abs));
+  } catch {
+    return null; // no world yet / unreadable - every caller treats this as "unknown"
+  }
+}
+
+const readServerLevelVersion = (serverId, worldName) => readServerLevel(serverId, worldName, readLevelVersion);
+const readServerLevelSeed = (serverId, worldName) => readServerLevel(serverId, worldName, readLevelSeed);
+const readServerLevelSpawn = (serverId, worldName) => readServerLevel(serverId, worldName, readLevelSpawn);
 
 function isDimName(name) {
   return DIM_SUFFIXES.some((s) => name.endsWith(s) && name.length > s.length);
@@ -1107,50 +1216,6 @@ async function isRunning(serverId) {
   return info.exists && ['running', 'starting', 'unhealthy'].includes(info.status);
 }
 
-// Parallel, bounded-concurrency directory size walker. World trees hold a great
-// many small files; serializing one fsp.stat at a time is needlessly slow (the
-// same pattern servers.js uses for backup size estimates).
-const DIR_SIZE_CONCURRENCY = 32;
-async function dirsSize(absDirs) {
-  const totals = await Promise.all(absDirs.map((dir) => dirSize(dir)));
-  return totals.reduce((a, b) => a + b, 0);
-}
-
-async function dirSize(abs) {
-  let entries;
-  try {
-    entries = await fsp.readdir(abs, { withFileTypes: true });
-  } catch {
-    return 0;
-  }
-  const jobs = [];
-  for (const e of entries) {
-    if (e.isSymbolicLink()) continue;
-    jobs.push(path.join(abs, e.name));
-  }
-  let i = 0;
-  const push = async (p) => {
-    try {
-      const st = await fsp.stat(p);
-      if (st.isDirectory()) return dirSize(p);
-      return st.size;
-    } catch {
-      return 0; // transient
-    }
-  };
-  const workers = Array.from({ length: Math.min(DIR_SIZE_CONCURRENCY, jobs.length) }, async () => {
-    let sub = 0; // worker-local accumulator avoids lost updates on a shared total
-    while (i < jobs.length) {
-      const p = jobs[i];
-      i += 1; // sync claim, safe across the pool
-      sub += await push(p);
-    }
-    return sub;
-  });
-  const results = await Promise.all(workers);
-  return results.reduce((a, b) => a + b, 0);
-}
-
 function sha256File(abs) {
   return new Promise((resolve, reject) => {
     const hash = crypto.createHash('sha256');
@@ -1169,16 +1234,6 @@ async function moveFile(from, to) {
     if (err.code !== 'EXDEV') throw err;
     await fsp.copyFile(from, to);
     await fsp.rm(from, { force: true });
-  }
-}
-
-async function moveEntry(from, to) {
-  try {
-    await fsp.rename(from, to);
-  } catch (err) {
-    if (err.code !== 'EXDEV') throw err;
-    await fsp.cp(from, to, { recursive: true });
-    await fsp.rm(from, { recursive: true, force: true });
   }
 }
 
@@ -1252,6 +1307,7 @@ module.exports = {
   importArchive,
   extractFromServer,
   listServerWorlds,
+  forgetWorlds,
   installWarnings,
   installToServer,
   copyWarnings,
@@ -1266,6 +1322,12 @@ module.exports = {
   deleteLibraryWorld,
   activeLevelName,
   serverWorldDims,
+  serverDirsSize,
+  forgetProps,
+  readProps,
+  readServerLevelVersion,
+  readServerLevelSeed,
+  readServerLevelSpawn,
   compatWarnings,
   readLevelVersion,
 };

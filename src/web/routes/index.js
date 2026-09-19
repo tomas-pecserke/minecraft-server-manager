@@ -400,9 +400,9 @@ router.get(
     };
     try {
       const onlineNames = running ? await playersService.listOnlineNames(row.id).catch(() => []) : [];
-      const found = playersService
-        .listPlayers(row.id, onlineNames)
-        .find((p) => (p.name || '').toLowerCase() === name.toLowerCase());
+      const found = (await playersService.listPlayers(row.id, onlineNames)).find(
+        (p) => (p.name || '').toLowerCase() === name.toLowerCase()
+      );
       if (found) player = found;
     } catch (err) {
       pageDegraded('player-page-roster', err); // offline / RCON down - render with the fallback
@@ -460,19 +460,9 @@ router.get(
     };
 
     if (tab === 'overview') {
-      // Connect addresses: the configured public domain first (if any), then LAN
-      // IPv4s + game port, ready to copy.
-      const os = require('node:os');
-      const addrs = [];
-      const publicAddr = require('../../services/settings').publicAddress(row.port_game);
-      if (publicAddr) addrs.push(publicAddr);
-      for (const nics of Object.values(os.networkInterfaces())) {
-        for (const nic of nics || []) {
-          if (nic.family === 'IPv4' && !nic.internal) addrs.push(`${nic.address}:${row.port_game}`);
-        }
-      }
-      addrs.push(`localhost:${row.port_game}`);
-      context.addresses = [...new Set(addrs)];
+      // Connect addresses: the configured public domain first (if any), then
+      // whichever machine actually publishes the port - see connectAddress.
+      context.addresses = require('../../services/connectAddress').connectCandidates(row.port_game);
     } else if (tab === 'chat') {
       const live = require('../../services/liveCache').get(row.id);
       context.onlinePlayers = (live && live.players && live.players.names) || [];
@@ -540,7 +530,7 @@ router.get(
       const mapService = require('../../services/map');
       const cfg = mapService.getMapConfig(row.id);
       context.mapEnabled = cfg.enabled;
-      context.mapSupported = mapService.supportsMap(row);
+      context.mapSupported = await mapService.supportsMap(row);
     } else if (tab === 'metrics') {
       // Real per-category sizes from the storage index (view contract:
       // [{label, size, pct, color}]; empty → "run a scan" state).
@@ -580,9 +570,12 @@ router.get(
       );
       context.recentEvents = eventsVM(eventsService.listEvents({ serverId: row.id, limit: 8 }));
 
-      // --- Per-world / per-dimension sizes + host disk free.
+      // --- Per-world / per-dimension sizes + host disk free. The sizes come
+      // from the storage index, like every other number on this card: this tab
+      // only prints them, and measuring them live is a walk of the whole world
+      // (a round trip to the Docker host, for a server whose files live there).
       try {
-        context.worldSizes = await require('../../services/worlds').listServerWorlds(row.id);
+        context.worldSizes = await require('../../services/worlds').listServerWorlds(row.id, { sizes: 'index' });
       } catch {
         context.worldSizes = [];
       }
@@ -679,12 +672,16 @@ router.get(
       const playersService = require('../../services/players');
       let online = [];
       if (server.status === 'running') {
-        online = await Promise.resolve(playersService.listOnlineNames(row.id)).catch(() => []);
+        // The live poller's answer when it is fresh - see players.onlineNames.
+        online = await playersService.onlineNames(row.id).catch(() => []);
       }
       try {
-        context.players = playersService.listPlayers(row.id, online);
-        context.bannedIps = playersService.listBannedIps(row.id);
-        context.whitelistEnforced = playersService.getWhitelistEnforced(row.id);
+        // One read of the server's player files covers the whole tab.
+        ({
+          players: context.players,
+          bannedIps: context.bannedIps,
+          whitelistEnforced: context.whitelistEnforced,
+        } = await playersService.rosterView(row.id, online));
       } catch (err) {
         pageDegraded('server-players-tab', err);
         context.players = [];
@@ -777,14 +774,14 @@ router.get('/blueprints', (req, res) => {
   });
 });
 
-router.get('/updates', (req, res) => {
+router.get('/updates', async (req, res) => {
   const checker = require('../../updates/checker');
   res.render('updates', {
     title: 'Updates',
     active: 'updates',
     // Changelog URLs come from remote platform APIs - allow only http(s) so a
     // hostile response can never plant a javascript: link.
-    updates: checker.listOutdated().map((u) => ({
+    updates: (await checker.listOutdated()).map((u) => ({
       ...u,
       changelog: /^https?:\/\//i.test(u.changelog || '') ? u.changelog : null,
     })),

@@ -188,7 +188,7 @@ async function applyPack(serverId, resolved, { actor = 'system', force = false }
   // different MC version than the existing world either crashes on boot
   // (downgrade) or irreversibly upgrades the world. Require explicit consent.
   if (!force) {
-    const warnings = worldVersionWarnings(server, resolved);
+    const warnings = await worldVersionWarnings(server, resolved);
     if (warnings.length) {
       const err = httpError(409, warnings.join(' '));
       err.warnings = warnings;
@@ -325,15 +325,13 @@ async function afterPackOperation(serverId, { actor = 'system' } = {}) {
 }
 
 /** Warnings when a pack's MC version conflicts with the server's existing world. */
-function worldVersionWarnings(server, resolved) {
+async function worldVersionWarnings(server, resolved) {
   if (!resolved.mcVersion) return [];
   const warnings = [];
   try {
     const worlds = require('./worlds');
-    const { dataPath } = require('../storage/pathGuard');
-    const path = require('node:path');
-    const level = worlds.activeLevelName(server);
-    const worldVersion = worlds.readLevelVersion(path.join(dataPath('servers', server.id), level, 'level.dat'));
+    const level = await worlds.activeLevelName(server);
+    const worldVersion = await worlds.readServerLevelVersion(server.id, level);
     if (worldVersion && worldVersion !== resolved.mcVersion) {
       const { parseVersion } = require('./javaMatrix');
       const wv = parseVersion(worldVersion);

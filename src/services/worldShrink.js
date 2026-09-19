@@ -30,7 +30,10 @@ const { recordEvent } = require('../events');
 const { inspectStatus } = require('../docker/containers');
 const { withSaveLock } = require('./serverLocks');
 const { guardOp } = require('./opLock');
-const { serverWorldDims, activeLevelName, isDimName, readLevelSpawn } = require('./worlds');
+const { serverWorldDims, activeLevelName, isDimName, readServerLevelSpawn } = require('./worlds');
+const serverFs = require('../storage/serverFs');
+const { dataPath } = require('../storage/pathGuard');
+const { nanoid } = require('nanoid');
 const { parseHeader, chunkInhabitedTime, repack } = require('../utils/mcaRegion');
 const db = require('../db');
 
@@ -91,47 +94,75 @@ async function isLive(serverId) {
  *   - Bukkit-style siblings (world_nether, world_the_end);
  *   - vanilla/Forge/Fabric sub-dimensions (DIM-1, DIM1, dimensions/<ns>/<name>).
  */
-function discoverDimensions(serverId, worldName) {
+async function discoverDimensions(serverId, worldName) {
+  const handle = serverFs.for(serverId);
   const dims = [];
   const seen = new Set();
-  const push = (dir, isOverworld) => {
-    if (seen.has(dir)) return;
-    seen.add(dir);
-    dims.push({ dir, isOverworld });
+  const push = (rel, isOverworld) => {
+    if (seen.has(rel)) return;
+    seen.add(rel);
+    dims.push({ rel, isOverworld });
   };
-  const siblings = serverWorldDims(serverId, worldName);
+  const siblings = await serverWorldDims(serverId, worldName);
   const main = siblings[0];
   push(main, !isDimName(worldName));
   for (const sibling of siblings.slice(1)) push(sibling, false);
   for (const sub of ['DIM-1', 'DIM1']) {
-    const dir = path.join(main, sub);
-    if (fs.existsSync(path.join(dir, 'region'))) push(dir, false);
+    if (await handle.exists(`${main}/${sub}/region`)) push(`${main}/${sub}`, false);
   }
-  const custom = path.join(main, 'dimensions');
-  let namespaces = [];
-  try {
-    namespaces = fs.readdirSync(custom, { withFileTypes: true }).filter((e) => e.isDirectory());
-  } catch {
-    /* no custom dimensions */
-  }
+  const custom = `${main}/dimensions`;
+  const namespaces = (await handle.readdir(custom).catch(() => [])).filter((e) => e.dir);
   for (const ns of namespaces) {
-    let names;
-    try {
-      names = fs.readdirSync(path.join(custom, ns.name), { withFileTypes: true }).filter((e) => e.isDirectory());
-    } catch {
-      continue;
-    }
+    const names = (await handle.readdir(`${custom}/${ns.name}`).catch(() => [])).filter((e) => e.dir);
     for (const n of names) {
-      const dir = path.join(custom, ns.name, n.name);
-      if (fs.existsSync(path.join(dir, 'region'))) push(dir, false);
+      const rel = `${custom}/${ns.name}/${n.name}`;
+      if (await handle.exists(`${rel}/region`)) push(rel, false);
     }
   }
   return dims;
 }
 
+/**
+ * Give `fn` a real directory holding the dimension's region + companion files.
+ * A server on this machine hands over the dimension itself; one on another
+ * Docker host gets those subdirectories copied here first, and whatever the
+ * shrink rewrote or deleted is sent back afterwards - only the touched files,
+ * which on a typical run is a small fraction of the world.
+ */
+async function withDimensionFiles(handle, dimRel, dryRun, fn) {
+  if (!handle.remote) return fn(handle.localPath(dimRel));
+
+  const staging = dataPath('tmp', `world-shrink-${nanoid(6)}`);
+  await fsp.mkdir(staging, { recursive: true });
+  const pulled = new Map(); // staged file name -> mtime when it arrived
+  try {
+    for (const sub of ['region', ...COMPANION_DIRS]) {
+      if (!(await handle.exists(`${dimRel}/${sub}`))) continue;
+      await handle.downloadDir(`${dimRel}/${sub}`, path.join(staging, sub));
+      for (const entry of await fsp.readdir(path.join(staging, sub)).catch(() => [])) {
+        const st = await fsp.stat(path.join(staging, sub, entry)).catch(() => null);
+        if (st && st.isFile()) pulled.set(`${sub}/${entry}`, st.mtimeMs);
+      }
+    }
+    const result = await fn(staging);
+    if (dryRun) return result;
+    for (const [name, mtimeMs] of pulled) {
+      const st = await fsp.stat(path.join(staging, name)).catch(() => null);
+      if (!st) {
+        await handle.remove(`${dimRel}/${name}`).catch(() => {}); // repacked to empty and deleted
+      } else if (st.mtimeMs !== mtimeMs) {
+        await handle.uploadFile(path.join(staging, name), `${dimRel}/${name}`);
+      }
+    }
+    return result;
+  } finally {
+    await fsp.rm(staging, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 /** Spawn chunk from level.dat (block coords >> 4); the origin when unreadable. */
-function spawnChunk(mainDir) {
-  const spawn = readLevelSpawn(path.join(mainDir, 'level.dat'));
+async function spawnChunk(serverId, worldRel) {
+  const spawn = await readServerLevelSpawn(serverId, worldRel);
   if (!spawn) return { cx: 0, cz: 0, source: 'origin' };
   return { cx: spawn.x >> 4, cz: spawn.z >> 4, source: 'level.dat' };
 }
@@ -234,16 +265,19 @@ async function shrinkWorldImpl(serverId, opts = {}) {
     : SPAWN_KEEP_CHUNKS;
   const dryRun = Boolean(opts.dryRun);
   const actor = opts.actor || 'system';
-  const worldName = opts.worldName || activeLevelName(server);
+  const worldName = opts.worldName || (await activeLevelName(server));
 
   // A dry run only reads region files, so it is allowed while the server is
   // up (that is what the Preview button promises). A chunk the JVM happens to
   // be rewriting at that instant just counts as unreadable in the estimate.
   if (!dryRun) await assertStopped(serverId);
 
-  const dims = discoverDimensions(serverId, worldName);
-  if (!dims.length || !fs.existsSync(dims[0].dir)) throw httpError(404, `No world named "${worldName}" on this server`);
-  const spawn = spawnChunk(dims[0].dir);
+  const handle = serverFs.for(serverId);
+  const dims = await discoverDimensions(serverId, worldName);
+  if (!dims.length || !(await handle.exists(dims[0].rel))) {
+    throw httpError(404, `No world named "${worldName}" on this server`);
+  }
+  const spawn = await spawnChunk(serverId, dims[0].rel);
 
   const run = async () => {
     // Re-check inside the critical section: shrink edits region files directly,
@@ -258,32 +292,34 @@ async function shrinkWorldImpl(serverId, opts = {}) {
     let bytesFreed = 0;
     const dimensions = [];
 
-    for (const { dir, isOverworld } of dims) {
-      const regionDir = path.join(dir, 'region');
-      let files;
-      try {
-        files = (await fsp.readdir(regionDir)).filter((f) => REGION_RE.test(f));
-      } catch {
-        continue; // dimension has no region folder
-      }
-      dimensions.push(path.relative(dims[0].dir, dir) || '.');
-      for (const file of files) {
-        const [, rxs, rzs] = REGION_RE.exec(file);
-        regionsScanned++;
-        const r = await shrinkRegionFile(regionDir, file, {
-          rx: Number(rxs),
-          rz: Number(rzs),
-          isOverworld,
-          spawn,
-          minInhabitedTicks,
-          spawnKeepChunks,
-          dryRun,
-        });
-        chunksScanned += r.chunksScanned;
-        chunksRemoved += r.chunksRemoved;
-        chunksUnreadable += r.chunksUnreadable;
-        bytesFreed += Math.max(0, r.bytesBefore - r.bytesAfter);
-      }
+    for (const { rel, isOverworld } of dims) {
+      await withDimensionFiles(handle, rel, dryRun, async (dimDir) => {
+        const regionDir = path.join(dimDir, 'region');
+        let files;
+        try {
+          files = (await fsp.readdir(regionDir)).filter((f) => REGION_RE.test(f));
+        } catch {
+          return; // dimension has no region folder
+        }
+        dimensions.push(rel === dims[0].rel ? '.' : rel.slice(dims[0].rel.length + 1) || rel);
+        for (const file of files) {
+          const [, rxs, rzs] = REGION_RE.exec(file);
+          regionsScanned++;
+          const r = await shrinkRegionFile(regionDir, file, {
+            rx: Number(rxs),
+            rz: Number(rzs),
+            isOverworld,
+            spawn,
+            minInhabitedTicks,
+            spawnKeepChunks,
+            dryRun,
+          });
+          chunksScanned += r.chunksScanned;
+          chunksRemoved += r.chunksRemoved;
+          chunksUnreadable += r.chunksUnreadable;
+          bytesFreed += Math.max(0, r.bytesBefore - r.bytesAfter);
+        }
+      });
     }
 
     if (!dryRun && chunksRemoved > 0) {

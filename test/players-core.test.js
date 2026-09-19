@@ -45,7 +45,7 @@ const BANNED_IPS = [
   },
 ];
 
-test('listPlayers merges all role files and flags online players', () => {
+test('listPlayers merges all role files and flags online players', async () => {
   const id = app.seedServer('pl_merge');
   seedFiles(id, {
     'usercache.json': USERCACHE,
@@ -53,7 +53,7 @@ test('listPlayers merges all role files and flags online players', () => {
     'ops.json': OPS,
     'banned-players.json': BANNED,
   });
-  const list = players.listPlayers(id, ['Steve']);
+  const list = await players.listPlayers(id, ['Steve']);
   assert.equal(list.length, 1);
   const p = list[0];
   assert.equal(p.name, 'Steve');
@@ -67,13 +67,13 @@ test('listPlayers merges all role files and flags online players', () => {
   assert.equal(p.banReason, 'bye');
 });
 
-test('listPlayers reflects an expired ban as pardoned', () => {
+test('listPlayers reflects an expired ban as pardoned', async () => {
   const id = app.seedServer('pl_exp');
   seedFiles(id, {
     'usercache.json': USERCACHE,
     'banned-players.json': [{ ...BANNED[0], expires: '2000-01-01 00:00:00 +0000' }],
   });
-  const p = players.listPlayers(id)[0];
+  const p = (await players.listPlayers(id))[0];
   assert.equal(p.banned, false);
   assert.equal(p.banReason, null);
   assert.equal(p.banExpires, null);
@@ -101,11 +101,11 @@ test('setWhitelisted rejects an invalid player name via assertName', async () =>
 test('setWhitelistEnforced toggles server.properties, and getWhitelistEnforced reads it', async () => {
   const id = app.seedServer('pl_props');
   seedFiles(id);
-  assert.equal(players.getWhitelistEnforced(id), false);
+  assert.equal(await players.getWhitelistEnforced(id), false);
   await players.setWhitelistEnforced(id, true);
-  assert.equal(players.getWhitelistEnforced(id), true);
+  assert.equal(await players.getWhitelistEnforced(id), true);
   await players.setWhitelistEnforced(id, false);
-  assert.equal(players.getWhitelistEnforced(id), false);
+  assert.equal(await players.getWhitelistEnforced(id), false);
 });
 
 test('setWhitelistEnforced edits an existing white-list line in place', async () => {
@@ -173,22 +173,22 @@ test('banIp/pardonIp round-trip and reject invalid IPs', async () => {
   await assert.rejects(() => players.pardonIp(id, 'not-an-ip'), /Invalid IP/);
 });
 
-test('listBannedIps filters expired entries', () => {
+test('listBannedIps filters expired entries', async () => {
   const id = app.seedServer('pl_lbip');
   seedFiles(id, {
     'banned-ips.json': [BANNED_IPS[0], { ...BANNED_IPS[0], ip: '5.6.7.8', expires: '2000-01-01 00:00:00 +0000' }],
   });
-  const list = players.listBannedIps(id);
+  const list = await players.listBannedIps(id);
   assert.equal(list.length, 1);
   assert.equal(list[0].ip, '1.2.3.4');
   assert.equal(list[0].expires, 'forever');
 });
 
-test('readJson rejects unsupported files and tolerates missing ones', () => {
+test('readJson rejects unsupported files and tolerates missing ones', async () => {
   const id = app.seedServer('pl_readjson');
   seedFiles(id);
-  assert.deepEqual(players.readJson(id, 'usercache.json'), []);
-  assert.throws(() => players.readJson(id, 'evil.json'), /Unsupported player file/);
+  assert.deepEqual(await players.readJson(id, 'usercache.json'), []);
+  await assert.rejects(() => players.readJson(id, 'evil.json'), /Unsupported player file/);
 });
 
 test('resolveIdentity resolves a known local player without network', async () => {

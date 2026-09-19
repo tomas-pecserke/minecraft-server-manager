@@ -5,10 +5,8 @@
 // to the browser only through the panel's authenticated proxy.
 
 const httpError = require('../utils/httpError');
-const fs = require('node:fs');
-const path = require('node:path');
 const db = require('../db');
-const { dataPath } = require('../storage/pathGuard');
+const serverFs = require('../storage/serverFs');
 const { recordEvent } = require('../events');
 const serversService = require('./servers');
 const modsService = require('./mods');
@@ -42,16 +40,16 @@ function getMapConfig(serverId) {
   return { enabled: Boolean(row.enabled), hostPort: cfg.hostPort || null };
 }
 
-function supportsMap(server) {
-  return SUPPORTED.has(server.type) || (modsService.isPackServer(server) && modsService.loaderOf(server));
+async function supportsMap(server) {
+  if (SUPPORTED.has(server.type)) return true;
+  return Boolean(modsService.isPackServer(server) && (await modsService.loaderOf(server)));
 }
 
 /** Plugin servers read plugins/BlueMap/, mod servers config/bluemap/. */
-function mapConfDir(serverId, server) {
-  const rel = ['PAPER', 'PURPUR', 'PUFFERFISH', 'LEAF', 'FOLIA', 'SPIGOT'].includes(server.type)
-    ? ['plugins', 'BlueMap']
-    : ['config', 'bluemap'];
-  return dataPath('servers', serverId, ...rel);
+function mapConfDir(server) {
+  return ['PAPER', 'PURPUR', 'PUFFERFISH', 'LEAF', 'FOLIA', 'SPIGOT'].includes(server.type)
+    ? 'plugins/BlueMap'
+    : 'config/bluemap';
 }
 
 // world/nether/end, matching BlueMap's OWN default map ids exactly - so this
@@ -77,41 +75,42 @@ const DIM_CONFIGS = [
  * Only ever touches the `world:` line - a file BlueMap (or the admin) already
  * created keeps every other setting (name, sky-color, start-pos, …) as-is.
  */
-function writeMapConfigs(serverId) {
+async function writeMapConfigs(serverId) {
   const server = serversService.getServer(serverId);
   if (!server) return;
+  const handle = serverFs.for(serverId);
   // The level name lands inside a quoted HOCON string (`world: "<name>"`). It
   // comes from the free-form LEVEL env / server.properties, so strip the two
   // characters (") and (newline) that could break out of that string and inject
   // config lines. A real Minecraft level-name never contains them anyway.
-  const level = String(require('./worlds').activeLevelName(server)).replace(/["\r\n]/g, '');
-  const mapsDir = path.join(mapConfDir(serverId, server), 'maps');
-  fs.mkdirSync(mapsDir, { recursive: true });
+  const level = String(await require('./worlds').activeLevelName(server)).replace(/["\r\n]/g, '');
+  const mapsDir = `${mapConfDir(server)}/maps`;
+  await handle.mkdir(mapsDir);
 
   for (const dim of DIM_CONFIGS) {
     const worldFolder = level + dim.suffix;
     // Nether/end aren't generated until first visited - skip rather than
     // point BlueMap at a dir that doesn't exist yet (same failure this fixes).
-    if (dim.suffix && !fs.existsSync(dataPath('servers', serverId, worldFolder))) continue;
+    if (dim.suffix && !(await handle.exists(worldFolder))) continue;
 
-    const file = path.join(mapsDir, dim.file);
+    const file = `${mapsDir}/${dim.file}`;
     const worldLine = `world: "${worldFolder}"`;
-    if (!fs.existsSync(file)) {
-      fs.writeFileSync(file, `${worldLine}\ndimension: "${dim.dimension}"\nname: "${dim.name}"\n`);
+    const text = await handle.readText(file);
+    if (text === null) {
+      await handle.writeFile(file, `${worldLine}\ndimension: "${dim.dimension}"\nname: "${dim.name}"\n`);
       continue;
     }
-    const text = fs.readFileSync(file, 'utf8');
     const escaped = worldFolder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     if (new RegExp(`^world\\s*:\\s*"?${escaped}"?\\s*$`, 'm').test(text)) continue; // already correct
     const patched = /^world\s*:.*$/m.test(text) ? text.replace(/^world\s*:.*$/m, worldLine) : `${worldLine}\n${text}`;
-    fs.writeFileSync(file, patched);
+    await handle.writeFile(file, patched);
   }
 }
 
 async function enableMap(serverId, { actor = 'system' } = {}) {
   const server = serversService.getServer(serverId);
   if (!server) throw httpError(404, 'Server not found');
-  if (!supportsMap(server)) {
+  if (!(await supportsMap(server))) {
     throw httpError(400, `Live map needs a mod loader or plugin server. BlueMap does not support ${server.type}.`);
   }
 
@@ -129,18 +128,15 @@ async function enableMap(serverId, { actor = 'system' } = {}) {
 
   // Pre-accept BlueMap's resource download so the map works without a manual
   // config edit (BlueMap merges missing keys with its defaults).
-  const confDir = mapConfDir(serverId, server);
-  fs.mkdirSync(confDir, { recursive: true });
-  const coreConf = path.join(confDir, 'core.conf');
-  if (!fs.existsSync(coreConf)) {
-    fs.writeFileSync(coreConf, 'accept-download: true\n');
-  } else if (!/accept-download\s*:\s*true/.test(fs.readFileSync(coreConf, 'utf8'))) {
-    fs.writeFileSync(
-      coreConf,
-      fs.readFileSync(coreConf, 'utf8').replace(/accept-download\s*:\s*false/, 'accept-download: true')
-    );
+  const handle = serverFs.for(serverId);
+  const coreConf = `${mapConfDir(server)}/core.conf`;
+  const existing = await handle.readText(coreConf);
+  if (existing === null) {
+    await handle.writeFile(coreConf, 'accept-download: true\n');
+  } else if (!/accept-download\s*:\s*true/.test(existing)) {
+    await handle.writeFile(coreConf, existing.replace(/accept-download\s*:\s*false/, 'accept-download: true'));
   }
-  writeMapConfigs(serverId);
+  await writeMapConfigs(serverId);
   db.run('UPDATE servers SET pending_recreate = 1 WHERE id = ?', serverId);
   recordEvent({
     serverId,

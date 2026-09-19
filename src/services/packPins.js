@@ -101,7 +101,7 @@ function assertPinnedPackEnv(type, env) {
  * Never resolves "latest": no evidence → no pin (the settings UI shows an
  * unpinned warning with a manual picker instead).
  */
-function findPinEvidence(server, issue) {
+async function findPinEvidence(server, issue) {
   const pack = require('./packs').getPack(server.id);
   if (pack && pack.platform === issue.platform && pack.pinned_version_id) {
     return {
@@ -111,18 +111,12 @@ function findPinEvidence(server, issue) {
     };
   }
 
-  const fs = require('node:fs');
-  const { dataPath } = require('../storage/pathGuard');
-  const readManifest = (file) => {
-    try {
-      return JSON.parse(fs.readFileSync(path.join(dataPath('servers', server.id), file), 'utf8'));
-    } catch {
-      return null; // absent or unreadable - simply not evidence
-    }
-  };
+  const handle = require('../storage/serverFs').for(server.id);
+  // Absent or unreadable simply isn't evidence, which readJson already reports as null.
+  const readManifest = (file) => handle.readJson(file);
 
   if (issue.platform === 'curseforge') {
-    const m = readManifest('.curseforge-manifest.json');
+    const m = await readManifest('.curseforge-manifest.json');
     if (!m || !m.fileId) return null;
     const expected =
       (server.env.CF_SLUG || '').trim().toLowerCase() ||
@@ -136,7 +130,7 @@ function findPinEvidence(server, issue) {
     };
   }
   if (issue.platform === 'modrinth') {
-    const m = readManifest('.modrinth-manifest.json');
+    const m = await readManifest('.modrinth-manifest.json');
     if (!m || !m.versionId) return null;
     const ref = String(server.env.MODRINTH_MODPACK || '').trim();
     const expected = ref && !ref.includes('/') ? ref.toLowerCase() : null;
@@ -152,7 +146,7 @@ function findPinEvidence(server, issue) {
  * next recreate can't silently upgrade it. Evidence-less servers are only
  * logged - the UI warns and offers a manual pick.
  */
-function pinUnpinnedServers() {
+async function pinUnpinnedServers() {
   const db = require('../db');
   const { recordEvent } = require('../events');
   const serversService = require('./servers');
@@ -165,7 +159,7 @@ function pinUnpinnedServers() {
     const env = { ...server.env };
     const applied = [];
     for (const issue of issues) {
-      const evidence = findPinEvidence(server, issue);
+      const evidence = await findPinEvidence(server, issue);
       if (!evidence) {
         unresolved += 1;
         logger.warn('A server has an unpinned modpack and no installed version could be read - pin it manually.', {

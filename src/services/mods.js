@@ -10,14 +10,20 @@
 //             toggled instantly by renaming to .jar.disabled.
 
 const httpError = require('../utils/httpError');
-const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { nanoid } = require('nanoid');
 const db = require('../db');
-const { dataPath } = require('../storage/pathGuard');
-const { recordEvent } = require('../events');
+const serverFs = require('../storage/serverFs');
+const { recordEvent: recordEventRaw } = require('../events');
+
+// Every content change in this module records an event, so that is the one
+// place the cached listing has to be dropped - no mutator can forget to.
+function recordEvent(event) {
+  if (event && event.serverId) forgetContent(event.serverId);
+  return recordEventRaw(event);
+}
 const library = require('./library');
 const modrinth = require('./modrinthApi');
 const curseforge = require('./curseforgeApi');
@@ -51,16 +57,19 @@ function nameIsFilenameLike(name, filename) {
 
 const ADOPT_HASH_CACHE_MAX = 2000;
 
-async function sha256File(abs, stat) {
-  // Keyed by path so a changed file overwrites its entry instead of adding one;
-  // bounded so a long-lived panel with churning content dirs cannot grow it forever.
+async function sha256File(handle, rel, stat) {
+  // Keyed by server + path so a changed file overwrites its entry instead of
+  // adding one; bounded so a long-lived panel with churning content dirs cannot
+  // grow it forever. The stream comes from serverFs, so a server on another
+  // Docker host hashes its bytes as they arrive rather than needing a copy here.
+  const key = `${handle.serverId}:${rel}`;
   const stamp = `${stat ? stat.mtimeMs : 0}:${stat ? stat.size : 0}`;
-  const cached = adoptHashCache.get(abs);
+  const cached = adoptHashCache.get(key);
   if (cached && cached.stamp === stamp) return cached.hex;
   let hex;
   try {
     const hash = crypto.createHash('sha256');
-    await require('node:stream/promises').pipeline(fs.createReadStream(abs), hash);
+    await require('node:stream/promises').pipeline(await handle.readStream(rel), hash);
     hex = hash.digest('hex');
   } catch {
     hex = null;
@@ -68,7 +77,7 @@ async function sha256File(abs, stat) {
   if (adoptHashCache.size >= ADOPT_HASH_CACHE_MAX) {
     adoptHashCache.delete(adoptHashCache.keys().next().value); // oldest insertion
   }
-  adoptHashCache.set(abs, { stamp, hex });
+  adoptHashCache.set(key, { stamp, hex });
   return hex;
 }
 
@@ -123,12 +132,13 @@ function contentDir(server, kind) {
 // 'mod' silently missed datapacks/resourcepacks (looked in mods/plugins, found
 // nothing, reported success without touching the file). Probe every content dir
 // instead of guessing, so toggle/remove actually reach the file wherever it is.
-function locateContentDir(server, row, file) {
+async function locateContentDir(server, row, file) {
   if (row) return contentDir(server, row.kind);
+  const handle = serverFs.for(server.id);
   for (const kind of ['mod', 'datapack', 'resourcepack']) {
     const dirRel = contentDir(server, kind);
-    const base = dataPath('servers', server.id, dirRel, file);
-    if (fs.existsSync(base) || fs.existsSync(`${base}.disabled`)) return dirRel;
+    const [there, disabled] = await handle.statMany([`${dirRel}/${file}`, `${dirRel}/${file}.disabled`]);
+    if (there || disabled) return dirRel;
   }
   return contentDir(server, 'mod'); // not found anywhere - fall back to the old default
 }
@@ -151,18 +161,18 @@ function contentKindOf(server) {
 const loaderCache = new Map(); // serverId -> { loader, expiresAt }
 const LOADER_CACHE_TTL_MS = 60 * 1000;
 
-function detectPackLoader(serverId) {
+async function detectPackLoader(serverId) {
   const cached = loaderCache.get(serverId);
   if (cached && cached.expiresAt > Date.now()) return cached.loader;
-  let names;
-  try {
-    names = fs.readdirSync(dataPath('servers', serverId));
-  } catch {
-    return null;
-  }
+  const entries = await serverFs
+    .for(serverId)
+    .readdir('')
+    .catch(() => null);
+  if (!entries) return null;
+  const names = new Set(entries.map((e) => e.name));
   let loader = null;
   for (const candidate of ['neoforge', 'forge', 'fabric', 'quilt']) {
-    if (names.includes(`.${candidate}-manifest.json`)) {
+    if (names.has(`.${candidate}-manifest.json`)) {
       loader = candidate;
       break;
     }
@@ -171,19 +181,39 @@ function detectPackLoader(serverId) {
   return loader;
 }
 
-function loaderOf(server) {
+async function loaderOf(server) {
   const map = { FABRIC: 'fabric', QUILT: 'quilt', FORGE: 'forge', NEOFORGE: 'neoforge' };
   if (map[server.type]) return map[server.type];
   if (PLUGIN_TYPES.has(server.type)) return 'paper';
   if (server.type === 'AUTO_CURSEFORGE' || server.type === 'MODRINTH' || server.type === 'FTBA') {
     const envLoader = (server.env.MODRINTH_LOADER || server.env.CF_MOD_LOADER || '').toLowerCase();
-    return envLoader || detectPackLoader(server.id) || null;
+    return envLoader || (await detectPackLoader(server.id)) || null;
   }
   return null;
 }
 
+// The mods tab renders the list server-side and the browser asks for the same
+// list again as soon as the page loads, so the scan is held briefly and shared.
+// Every path that changes what is installed drops it (forgetContent), and a
+// modpack's few hundred files are re-scanned the moment it expires.
+const contentCache = new Map(); // serverId -> { at, items }
+const CONTENT_TTL_MS = 3000;
+
+/** Drop a server's cached content listing (after anything that changes it). */
+function forgetContent(serverId) {
+  contentCache.delete(serverId);
+}
+
 /** List installed content: DB overlay rows + on-disk scan for pack/unknown files. */
 async function listContent(serverId) {
+  const cached = contentCache.get(serverId);
+  if (cached && Date.now() - cached.at < CONTENT_TTL_MS) return cached.items;
+  const items = await scanContent(serverId);
+  contentCache.set(serverId, { at: Date.now(), items });
+  return items;
+}
+
+async function scanContent(serverId) {
   const server = serversService.getServer(serverId);
   if (!server) throw httpError(404, 'Server not found');
   const primaryKind = contentKindOf(server);
@@ -290,13 +320,13 @@ async function listContent(serverId) {
   // exact file name that is UNIQUE within the category, is certain enough. A
   // name shared by several library rows, a case-only match, or a stem-only
   // match drives display but nothing more.
-  const matchOrphanLib = async (baseName, kind, absPath, stat) => {
+  const matchOrphanLib = async (baseName, kind, handle, rel, stat) => {
     if (!canAdopt) return { lib: null, confident: false };
     const { byExactName, byLowerName, bySha, byStem } = buildAdoptIndex();
     const ok = adoptableCategories(kind);
     const fit = (rows) => (rows || []).filter((r) => ok.has(r.category));
     const exact = fit(byExactName.get(baseName));
-    const sha = await sha256File(absPath, stat);
+    const sha = await sha256File(handle, rel, stat);
     const shaHit = sha && bySha.get(sha);
     // A content-hash match is certain whatever the file is called.
     if (shaHit && ok.has(shaHit.category)) return { lib: shaHit, confident: true };
@@ -315,25 +345,25 @@ async function listContent(serverId) {
 
   // Datapacks and resource packs work on every server type (vanilla included),
   // unlike mods/plugins which are loader/platform-specific - always scan all
-  // three dirs, not just the one matching this server's type.
-  for (const kind of [primaryKind, 'datapack', 'resourcepack']) {
-    const dirAbs = dataPath('servers', serverId, contentDir(server, kind));
-    let entries;
-    try {
-      entries = await fsp.readdir(dirAbs, { withFileTypes: true });
-    } catch {
-      continue; // dir doesn't exist yet
-    }
+  // three dirs, not just the one matching this server's type. One listing call
+  // covers them: separately, each is a round trip on a remote host.
+  const kinds = [primaryKind, 'datapack', 'resourcepack'];
+  const listings = await serverFs.for(serverId).readdirMany(kinds.map((kind) => contentDir(server, kind)));
+  for (const [index, kind] of kinds.entries()) {
+    const dirRel = contentDir(server, kind);
+    const entries = listings[index];
+    if (!entries.length) continue; // nothing there (or no such dir yet)
 
+    const handle = serverFs.for(serverId);
     for (const entry of entries) {
-      if (!entry.isFile()) continue;
+      if (entry.dir) continue;
       const isDisabled = entry.name.endsWith('.disabled');
       const baseName = entry.name.replace(/\.disabled$/, '');
       if (!baseName.endsWith('.jar') && !baseName.endsWith('.zip')) continue;
       seen.add(baseName);
       const row = byFile.get(baseName);
-      const absPath = path.join(dirAbs, entry.name);
-      const stat = await fsp.stat(absPath).catch(() => null);
+      const entryRel = `${dirRel}/${entry.name}`;
+      const stat = entry;
 
       // A file with no server_content row is an orphaned custom install - the row
       // was dropped (e.g. migration 016) or never written while the file stayed
@@ -342,7 +372,7 @@ async function listContent(serverId) {
       // row when the match is certain.
       let adoptedLib = null;
       if (!row) {
-        const m = await matchOrphanLib(baseName, kind, absPath, stat);
+        const m = await matchOrphanLib(baseName, kind, handle, entryRel, stat);
         adoptedLib = m.lib;
         if (adoptedLib && m.confident) healOverlayRow(serverId, adoptedLib, baseName, kind);
       }
@@ -507,7 +537,7 @@ async function installFromUrl(serverId, input, { actor = 'system', kind, onProgr
   // plugin builds paper/spigot/bukkit (a strict facet would hide spigot-only
   // plugins) and datapack/resourcepack builds by content type, so filtering
   // those by the server's loader over-filters to zero. The override waives it.
-  const loader = loaderOf(server);
+  const loader = await loaderOf(server);
   const effectiveLoader = ignoreVersion || targetKind !== 'mod' ? undefined : loader;
 
   const source = classifyModSource(input);
@@ -796,7 +826,7 @@ async function installResolved(
   // meta.mcVersions/meta.loaders are only set for modrinth sources (curseforge
   // has no meta.loaders at all) - a direct-URL install has nothing to compare
   // against either way, so neither flag ever fires for one.
-  const overrideLoader = kind === 'mod' ? loaderOf(server) : null;
+  const overrideLoader = kind === 'mod' ? await loaderOf(server) : null;
   const versionOverridden =
     ignoreVersion &&
     server.mc_version &&
@@ -837,11 +867,13 @@ async function setEnabled(serverId, file, enabled, { actor = 'system' } = {}) {
   const managedBy = row ? row.managed_by : isPackServer(server) ? 'pack' : 'overlay';
 
   if (managedBy === 'overlay' || !isPackServer(server)) {
-    const dirRel = locateContentDir(server, row, file);
-    const base = dataPath('servers', serverId, dirRel, file);
+    const handle = serverFs.for(serverId);
+    const dirRel = await locateContentDir(server, row, file);
+    const base = `${dirRel}/${file}`;
     const disabled = `${base}.disabled`;
-    if (enabled && fs.existsSync(disabled)) await fsp.rename(disabled, base);
-    else if (!enabled && fs.existsSync(base)) await fsp.rename(base, disabled);
+    const [onDisk, offDisk] = await handle.statMany([base, disabled]);
+    if (enabled && offDisk) await handle.rename(disabled, base);
+    else if (!enabled && onDisk) await handle.rename(base, disabled);
     if (row) db.run('UPDATE server_content SET enabled = ? WHERE id = ?', enabled ? 1 : 0, row.id);
     recordEvent({
       serverId,
@@ -859,7 +891,7 @@ async function setEnabled(serverId, file, enabled, { actor = 'system' } = {}) {
   const env = { ...server.env };
   const isCF = server.type === 'AUTO_CURSEFORGE';
   const varName = isCF ? 'CF_EXCLUDE_MODS' : 'MODRINTH_EXCLUDE_FILES';
-  const fromManifest = packManifestIndex(serverId).get(file.replace(/\.disabled$/, ''));
+  const fromManifest = (await packManifestIndex(serverId)).get(file.replace(/\.disabled$/, ''));
   const token =
     (fromManifest && (fromManifest.slug || fromManifest.projectId)) ||
     (row && row.icon_url && row.name
@@ -896,13 +928,14 @@ async function removeContent(serverId, file, { actor = 'system' } = {}) {
   // "pack" classification (row-less + pack server ⇒ pack-managed) instead.
   const managedByPack = row ? row.managed_by === 'pack' : isPackServer(server);
   if (managedByPack) throw httpError(409, 'Pack-managed content is excluded, not deleted. Use Disable instead.');
-  const dirRel = locateContentDir(server, row, file);
+  const dirRel = await locateContentDir(server, row, file);
   let freed = 0;
+  const removeHandle = serverFs.for(serverId);
   for (const candidate of [file, `${file}.disabled`]) {
-    const abs = dataPath('servers', serverId, dirRel, candidate);
-    if (fs.existsSync(abs)) {
-      freed = (await fsp.stat(abs)).size;
-      await fsp.rm(abs);
+    const st = await removeHandle.statOrNull(`${dirRel}/${candidate}`);
+    if (st) {
+      freed = st.size;
+      await removeHandle.remove(`${dirRel}/${candidate}`);
     }
   }
   if (row) db.run('DELETE FROM server_content WHERE id = ?', row.id);
@@ -1020,12 +1053,14 @@ async function reapplyOverlay(serverId, { actor = 'system' } = {}) {
     serverId
   );
   let restored = 0;
+  const overlayHandle = serverFs.for(serverId);
   for (const row of rows) {
     const dirRel = contentDir(server, row.kind);
-    const target = dataPath('servers', serverId, dirRel, row.enabled ? row.filename : `${row.filename}.disabled`);
-    if (!fs.existsSync(target) && !fs.existsSync(`${target}.disabled`)) {
+    const target = `${dirRel}/${row.enabled ? row.filename : `${row.filename}.disabled`}`;
+    const [here, disabled] = await overlayHandle.statMany([target, `${target}.disabled`]);
+    if (!here && !disabled) {
       await library.installToServer(row.library_id, serverId, dirRel, { filename: row.filename });
-      if (!row.enabled) await fsp.rename(dataPath('servers', serverId, dirRel, row.filename), target);
+      if (!row.enabled) await overlayHandle.rename(`${dirRel}/${row.filename}`, target);
       restored += 1;
     }
   }
@@ -1057,14 +1092,10 @@ function prettifyJarName(file) {
 // supplied by hand - this turns that dead-end into guided actions.
 
 /** Best-effort filename -> {slug, projectId} map from the pack's CF manifest. */
-function packManifestIndex(serverId) {
+async function packManifestIndex(serverId) {
   const map = new Map();
-  let data;
-  try {
-    data = JSON.parse(fs.readFileSync(dataPath('servers', serverId, '.curseforge-manifest.json'), 'utf8'));
-  } catch {
-    return map;
-  }
+  const data = await serverFs.for(serverId).readJson('.curseforge-manifest.json');
+  if (!data) return map;
   const visit = (node) => {
     if (!node || typeof node !== 'object') return;
     if (Array.isArray(node)) return node.forEach(visit);
@@ -1102,33 +1133,27 @@ function parseModsNeedDownload(text) {
 }
 
 /** Mods a CF pack needs supplied by hand, parsed from the server's MODS_NEED_DOWNLOAD.txt. */
-function pendingDownloads(serverId) {
-  try {
-    return parseModsNeedDownload(fs.readFileSync(dataPath('servers', serverId, 'MODS_NEED_DOWNLOAD.txt'), 'utf8'));
-  } catch {
-    return [];
-  }
+async function pendingDownloads(serverId) {
+  const text = await serverFs.for(serverId).readText('MODS_NEED_DOWNLOAD.txt');
+  return text === null ? [] : parseModsNeedDownload(text);
 }
 
 /** The exclusion token (slug preferred) for a pending mod identified by filename. */
-function pendingExcludeToken(serverId, filename) {
-  const entry = pendingDownloads(serverId).find((p) => p.filename === filename);
+async function pendingExcludeToken(serverId, filename) {
+  const entry = (await pendingDownloads(serverId)).find((p) => p.filename === filename);
   return (entry && entry.slug) || String(filename).replace(/(-[\d.]+.*)?\.jar$/, '');
 }
 
 /** Drop a resolved mod's line from MODS_NEED_DOWNLOAD.txt (best-effort). */
-function clearPendingLine(serverId, filename) {
-  const file = dataPath('servers', serverId, 'MODS_NEED_DOWNLOAD.txt');
-  let text;
-  try {
-    text = fs.readFileSync(file, 'utf8');
-  } catch {
-    return;
-  }
+async function clearPendingLine(serverId, filename) {
+  const handle = serverFs.for(serverId);
+  const file = 'MODS_NEED_DOWNLOAD.txt';
+  const text = await handle.readText(file);
+  if (text === null) return;
   const kept = text.split(/\r?\n/).filter((l) => !filename || !l.includes(filename));
   try {
-    if (kept.some((l) => /curseforge\.com/i.test(l))) fs.writeFileSync(file, kept.join('\n'));
-    else fs.rmSync(file, { force: true });
+    if (kept.some((l) => /curseforge\.com/i.test(l))) await handle.writeFile(file, kept.join('\n'));
+    else await handle.remove(file);
   } catch {
     /* ownership not aligned yet - the banner clears on the next successful start */
   }
@@ -1248,6 +1273,7 @@ module.exports = {
   classifyModSource,
   setEnabled,
   removeContent,
+  forgetContent,
   setIgnoredUpdate,
   applyOverlayUpdate,
   reapplyOverlay,

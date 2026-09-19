@@ -78,11 +78,11 @@ test('unlockPropertyEnv is a no-op when no matching env var is set', () => {
   assert.equal(rowPending(), 0);
 });
 
-test('writeServerProperties writes the file and un-sets only the changed env-backed props', () => {
+test('writeServerProperties writes the file and un-sets only the changed env-backed props', async () => {
   fs.writeFileSync(dataPath('servers', ID, 'server.properties'), 'gamemode=survival\npvp=true\n');
   setEnv({ PVP: 'true', MODE: 'survival', MAX_PLAYERS: '20' });
   const newText = 'gamemode=creative\npvp=false\nmin-players=8\n';
-  const result = servers.writeServerProperties(ID, newText, { actor: 'test' });
+  const result = await servers.writeServerProperties(ID, newText, { actor: 'test' });
   assert.equal(propertiesText(), newText); // exact content, no debris
   // gamemode and pvp both changed → both env vars un-set; min-players isn't a
   // catalog env var so it can never unlock anything.
@@ -92,9 +92,9 @@ test('writeServerProperties writes the file and un-sets only the changed env-bac
   assert.equal(rowPending(), 1);
 });
 
-test('a direct motd edit un-sets the MOTD env so the last write wins', () => {
+test('a direct motd edit un-sets the MOTD env so the last write wins', async () => {
   setEnv({ MOTD: 'Old' });
-  const result = servers.writeServerProperties(ID, 'motd=New!\n', { actor: 'test' });
+  const result = await servers.writeServerProperties(ID, 'motd=New!\n', { actor: 'test' });
   assert.deepEqual(result.unlocked, ['MOTD']);
   assert.deepEqual(envOf(), {});
 });
@@ -124,9 +124,9 @@ test('the offline whitelist toggle clears every provisioning env var, not just E
   assert.equal(propertiesText().includes('white-list=true'), true);
 });
 
-test('writeServerProperties and unlockPropertyEnv 404 on an unknown server', () => {
+test('writeServerProperties and unlockPropertyEnv 404 on an unknown server', async () => {
   assert.throws(() => servers.unlockPropertyEnv('srv_nope', ['pvp']), /Server not found/);
-  assert.throws(() => servers.writeServerProperties('srv_nope', 'pvp=false\n'), /Server not found/);
+  await assert.rejects(() => servers.writeServerProperties('srv_nope', 'pvp=false\n'), /Server not found/);
   assert.throws(() => servers.unsetEnvKeys('srv_nope', ['WHITELIST']), /Server not found/);
 });
 
@@ -149,19 +149,19 @@ test('Files editor writes to server.properties go through the choke point', asyn
   assert.equal(rowPending(), 0);
 });
 
-test('setServerProperty replaces one key in place, appends when absent, and un-sets its env', () => {
+test('setServerProperty replaces one key in place, appends when absent, and un-sets its env', async () => {
   fs.writeFileSync(dataPath('servers', ID, 'server.properties'), 'pvp=true\nmax-players=20\n');
   setEnv({ PVP: 'true', DIFFICULTY: 'easy' });
-  let result = servers.setServerProperty(ID, 'pvp', 'false', { actor: 'test' });
+  let result = await servers.setServerProperty(ID, 'pvp', 'false', { actor: 'test' });
   assert.equal(propertiesText(), 'pvp=false\nmax-players=20\n');
   assert.deepEqual(result, { rebuildNeeded: true, unlocked: ['PVP'] });
-  result = servers.setServerProperty(ID, 'difficulty', 'hard', { actor: 'test' });
+  result = await servers.setServerProperty(ID, 'difficulty', 'hard', { actor: 'test' });
   assert.equal(propertiesText(), 'pvp=false\nmax-players=20\ndifficulty=hard\n');
   assert.deepEqual(result, { rebuildNeeded: true, unlocked: ['DIFFICULTY'] });
   assert.deepEqual(envOf(), {});
   // Same value again: nothing changed, nothing to unlock.
   setEnv({ DIFFICULTY: 'hard' });
-  result = servers.setServerProperty(ID, 'difficulty', 'hard', { actor: 'test' });
+  result = await servers.setServerProperty(ID, 'difficulty', 'hard', { actor: 'test' });
   assert.deepEqual(result, { rebuildNeeded: false, unlocked: [] });
   assert.deepEqual(envOf(), { DIFFICULTY: 'hard' });
 });

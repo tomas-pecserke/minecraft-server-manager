@@ -179,3 +179,49 @@ test('TRUST_PROXY / COOKIE_SECURE resolve to usable values', () => {
   assert.equal(out.cs, 'auto');
   assert.equal(out.exposed, true);
 });
+
+// SERVER_STORAGE decides whether a server's /data is a directory on this
+// machine or a Docker volume on the daemon's host, so a remote DOCKER_HOST has
+// to flip it (and the map proxy) without anyone setting it by hand.
+function readStorage(extraEnv) {
+  const res = spawnSync(
+    process.execPath,
+    [
+      '-e',
+      "const c=require('./src/config'); process.stdout.write(JSON.stringify({storage:c.serverStorage,map:c.mapProxyHost}))",
+    ],
+    {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        DATA_DIR: process.env.DATA_DIR,
+        SESSION_SECRET: 'valid-session-secret-abcdef123456',
+        DOCKER_HOST: '',
+        SERVER_STORAGE: '',
+        MAP_PROXY_HOST: '',
+        ...extraEnv,
+      },
+      encoding: 'utf8',
+    }
+  );
+  return { res, out: res.status === 0 ? JSON.parse(res.stdout) : null };
+}
+
+test('server storage defaults to bind, and to a volume against a remote daemon', () => {
+  const local = readStorage({});
+  assert.equal(local.res.status, 0, local.res.stderr);
+  assert.equal(local.out.storage, 'bind');
+  assert.equal(local.out.map, '127.0.0.1');
+
+  const remote = readStorage({ DOCKER_HOST: 'tcp://10.0.0.5:2375' });
+  assert.equal(remote.res.status, 0, remote.res.stderr);
+  assert.equal(remote.out.storage, 'volume');
+  assert.equal(remote.out.map, '10.0.0.5', 'published ports live on the daemon host, not on ours');
+
+  const forced = readStorage({ DOCKER_HOST: 'tcp://10.0.0.5:2375', SERVER_STORAGE: 'bind' });
+  assert.equal(forced.out.storage, 'bind', 'an explicit setting wins over the DOCKER_HOST guess');
+
+  const bogus = readStorage({ SERVER_STORAGE: 'nfs' });
+  assert.notEqual(bogus.res.status, 0);
+  assert.match(bogus.res.stderr, /SERVER_STORAGE must be "bind" or "volume"/);
+});

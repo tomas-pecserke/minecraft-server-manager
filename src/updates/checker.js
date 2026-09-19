@@ -94,7 +94,7 @@ async function checkAll({ actor = 'scheduler' } = {}) {
     );
     const mcVersion =
       server.mc_version === 'LATEST' || server.mc_version === 'SNAPSHOT' ? undefined : server.mc_version;
-    const loader = modsService.loaderOf(server);
+    const loader = await modsService.loaderOf(server);
     for (const row of rows) {
       try {
         let latest = null;
@@ -316,7 +316,7 @@ async function checkStandaloneVersion(server, findings) {
     }
   }
 
-  const loader = modsService.loaderOf(server);
+  const loader = await modsService.loaderOf(server);
   const envKey = loader && LOADER_BUILD_ENV_KEY[loader];
   const pinned = envKey && server.env[envKey];
   if (pinned) {
@@ -375,7 +375,7 @@ function packChangelogUrl(platform, projectRef) {
 }
 
 /** Everything outdated, joined for the Updates page. */
-function listOutdated() {
+async function listOutdated() {
   const rows = [];
   // ignored rows stay in the list (greyed, with an "un-ignore" action) so the
   // Updates page is the one place to manage them; countOutdated() and the
@@ -467,7 +467,7 @@ function listOutdated() {
       const server = serversService.getServer(c.subject_id);
       if (server && server.update_policy === 'manual') continue;
       if (server) {
-        const loader = modsService.loaderOf(server);
+        const loader = await modsService.loaderOf(server);
         const envKey = loader && LOADER_BUILD_ENV_KEY[loader];
         if (envKey && server.env[envKey] === c.current_version) {
           rows.push({

@@ -62,6 +62,37 @@ async function scan() {
     }
 
     const total = await walk(root, '');
+
+    // Servers whose files live on the Docker host are not under this root at
+    // all - ask each one for its own sizes so quotas, the Storage page and the
+    // usage history cover them exactly as they cover local ones.
+    const serverFs = require('./serverFs');
+    if (serverFs.isRemote()) {
+      let serversTotal = { size: 0, files: 0 };
+      for (const row of db.all('SELECT id FROM servers WHERE deleted_at IS NULL')) {
+        let measured;
+        try {
+          measured = await serverFs.for(row.id).duTree();
+        } catch (err) {
+          logger.debug('Could not measure a server on the Docker host during the storage scan.', {
+            serverId: row.id,
+            err: err.message,
+          });
+          continue;
+        }
+        results.set(`servers/${row.id}`, { size: measured.size, files: measured.files });
+        // Per-child sizes drive the file manager's folder column; file counts
+        // below the server root are not worth another round trip.
+        for (const [name, size] of measured.children) {
+          results.set(`servers/${row.id}/${name}`, { size, files: 0 });
+        }
+        serversTotal = { size: serversTotal.size + measured.size, files: serversTotal.files + measured.files };
+      }
+      results.set('servers', serversTotal);
+      total.size += serversTotal.size;
+      total.files += serversTotal.files;
+    }
+
     results.set('', total);
 
     // Skip the DB rewrite when the walk produced exactly what the table already

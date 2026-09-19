@@ -7,6 +7,9 @@
 const path = require('node:path');
 const { getDocker } = require('./connect');
 const { toHostPath } = require('./hostPath');
+const { ensureVolume, removeVolume } = require('./volumes');
+const sidecar = require('./sidecar');
+const config = require('../config');
 const db = require('../db');
 
 const LABEL = 'msm.id';
@@ -64,8 +67,17 @@ async function createContainer(spec) {
     (b) => `${b.hostPath}:${b.containerPath}${b.mode === 'ro' ? ':ro' : ''}`
   );
 
+  // Volume storage: /data is a named volume on the daemon's own host, so the
+  // panel's local paths never enter the bind at all. That is what lets the
+  // daemon live on another machine - a bind mount can only name a directory the
+  // daemon itself can see.
+  const dataBind =
+    config.serverStorage === 'volume'
+      ? `${await ensureVolume(spec.serverId)}:/data`
+      : `${toHostPath(spec.dataDir)}:/data`;
+
   const hostConfig = {
-    Binds: [`${toHostPath(spec.dataDir)}:/data`, ...extraBindStrings],
+    Binds: [dataBind, ...extraBindStrings],
     PortBindings: bindings,
     Memory: memoryBytes,
     MemorySwap: swapBytes,
@@ -376,7 +388,15 @@ async function execCaptureChecked(serverId, cmd, opts = {}) {
  * the PARENT directory and remove the target by name. `Cmd: []` is required so
  * the image's default CMD isn't appended as extra arguments to our entrypoint.
  */
-async function removeDataDir(dir, image) {
+async function removeDataDir(serverId, dir, image) {
+  // Volume storage has no directory to clear: the data IS the volume, and
+  // dropping it takes the files with it. The sidecar holds the volume open, so
+  // it goes first.
+  if (config.serverStorage === 'volume') {
+    await sidecar.remove(serverId).catch(() => {});
+    await removeVolume(serverId);
+    return;
+  }
   const docker = getDocker();
   const parent = path.dirname(dir);
   const base = path.basename(dir);
@@ -406,6 +426,9 @@ async function removeDataDir(dir, image) {
  * the target by name; `Cmd: []` clears the image's default CMD (see removeDataDir).
  */
 async function chownDataDir(dir, image, uid, gid) {
+  // Only bind storage has a host-side owner to align - with a volume the panel
+  // reaches the files as root through the sidecar, whoever owns them.
+  if (config.serverStorage === 'volume') return;
   const docker = getDocker();
   const parent = path.dirname(dir);
   const base = path.basename(dir);

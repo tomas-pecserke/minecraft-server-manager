@@ -14,6 +14,7 @@ const { pipeline } = require('node:stream/promises');
 const { nanoid } = require('nanoid');
 const db = require('../db');
 const { dataPath } = require('../storage/pathGuard');
+const serverFs = require('../storage/serverFs');
 const { recordEvent } = require('../events');
 const { safeFetch } = require('../utils/urlGuard');
 const contentHashes = require('../utils/contentHashes');
@@ -300,16 +301,25 @@ async function installToServer(libraryId, serverId, destRel, { filename } = {}) 
   // container-runs-as-panel-user has files owned by uid 1000. Lazy require breaks
   // the servers<->library cycle.
   await require('./servers').ensureOwnership(serverId);
-  const destDir = dataPath('servers', serverId, destRel);
-  await fsp.mkdir(destDir, { recursive: true });
-  const target = path.join(destDir, sanitizeFilename(filename || lib.filename));
-  await fsp.rm(target, { force: true });
-  try {
-    await fsp.link(dataPath(lib.rel_path), target);
-  } catch {
-    await fsp.copyFile(dataPath(lib.rel_path), target);
+  const handle = serverFs.for(serverId);
+  const name = sanitizeFilename(filename || lib.filename);
+  const target = destRel ? `${destRel}/${name}` : name;
+  await handle.remove(target).catch(() => {});
+  if (handle.remote) {
+    // The library lives on the panel; the server's files may not. Send the
+    // bytes over rather than hard-linking into a directory that isn't there.
+    await handle.uploadFile(dataPath(lib.rel_path), target);
+  } else {
+    const abs = handle.localPath(target);
+    await fsp.mkdir(path.dirname(abs), { recursive: true });
+    try {
+      // A hard link keeps one copy on disk for every server using this file.
+      await fsp.link(dataPath(lib.rel_path), abs);
+    } catch {
+      await fsp.copyFile(dataPath(lib.rel_path), abs);
+    }
   }
-  return { installedPath: target, filename: path.basename(target) };
+  return { installedPath: target, filename: name };
 }
 
 /**

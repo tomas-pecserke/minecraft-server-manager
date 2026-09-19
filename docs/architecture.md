@@ -57,7 +57,8 @@ Dependencies flow in one direction:
   `images`, and a `watcher` that turns Docker events into history + crash detection.
 - **`db/`** - the SQLite wrapper and migration runner.
 - **`storage/`** - the `./data` bootstrap, the **path guard** (`safeJoin`, the file-safety
-  backbone), and the background size-indexer + quota enforcement.
+  backbone), `serverFs` (the one way anything reaches a server's files, see below), and the
+  background size-indexer + quota enforcement.
 
 Cross-cutting:
 
@@ -85,6 +86,74 @@ Cross-cutting:
   (`RATE_LIMIT_PUBLIC_API_PER_MIN`, default 120), keyed on a hash of the Bearer token with an IP
   fallback. A separate per-account soft counter in
   `src/web/middleware/auth.js` handles the login lockout (per-IP and account-global, decaying).
+
+## Where a server's files live
+
+A server's `/data` is reached through **`src/storage/serverFs.js`**, never through a path built by
+hand. It has two backends, chosen by `SERVER_STORAGE`:
+
+- **`bind`** (default on a local daemon) - the files are `data/servers/<id>` on the panel's own
+  disk, bind-mounted into the container. Every call is a plain `fs` call.
+- **`volume`** (default when `DOCKER_HOST` names a remote daemon) - the files are a Docker named
+  volume, `msm-<serverId>`, on the daemon's host. The panel has no path to them, so it works
+  through a **file sidecar**: a container (`msm-fs-<serverId>`, `src/docker/sidecar.js`) that
+  mounts that volume and nothing else. Reads and writes go through the Docker archive API, listings
+  and moves through `docker exec`. It starts on first use and stops (without being removed, so the
+  next use only has to start it) after `SIDECAR_IDLE_SECONDS`; boot removes only the ones whose
+  server no longer exists.
+
+The handle (`serverFs.for(serverId)`) is the same either way: `readFile`/`writeFile`,
+`readdir`/`walk`/`stat`/`statMany`, `rename`/`copy`/`remove`, `readStream`/`writeStream`,
+`uploadFile`/`uploadDir`/`downloadFile`/`downloadDir`, `du`/`duTree`, and `grepFiles`. Paths are
+relative to the server's data directory and are containment-checked on both sides - the remote
+backend re-checks inside the sidecar, so a symlink a mod plants cannot lead a read out of the mount.
+
+Two consequences worth knowing:
+
+- Code that needs a **real path** (NBT readers, zip readers) uses `withLocalCopy` /
+  `withLocalDir`, which materialise a temp copy under `data/tmp` and delete it afterwards. Use
+  them for single files or small subtrees, never for a whole world.
+- **Backups always land on the panel's disk**, streamed out of the volume as a tar and zipped here.
+  A remote server's archives therefore live on - and need free space on - the panel's machine.
+  Restore reverses it: extract here, park the volume's current contents inside the volume, upload,
+  then drop the parked copy.
+
+`serverFs.forLocalRoot(abs)` gives the same interface over a panel-local directory (the library,
+the admin file manager's `DATA_DIR` scope). Only a server's `/data` ever moves to another host.
+
+**Ports** follow a remote daemon rather than this machine too: `services/ports.js` probes a local
+socket only when the daemon is local; otherwise it unions the panel's own records with the ports
+containers already publish on the daemon's host (`daemonPortsInUse()`), since binding a socket here
+would say nothing about a machine somewhere else.
+
+`DOCKER_HOST` is handed to dockerode as-is; the panel adds no transport of its own. An `ssh://`
+endpoint is therefore whatever the client library makes of it, which is a fresh connection and
+re-authentication per API call - unusable for the file traffic this panel generates. Reach a remote
+daemon over `tcp://` (with TLS, or across a port forward you set up yourself), and give it a port:
+a port-less `tcp://host` resolves to port 80, not to 2375.
+
+### What volume storage costs
+
+Every read of a server's files becomes an exec in that server's sidecar. Measured against a daemon
+on the same LAN, one exec costs ~80ms regardless of what it asks for - create, start, attach, plus
+the process spawn inside the container - so the count of round trips, not the work per round trip,
+is what a page's render time is made of. A tab that only reads the database renders in ~45ms; the
+worlds tab, which lists the world dirs, probes each for `level.dat` and measures them, renders in
+~130ms. This is the cost of reaching files through the Docker API rather than of the daemon being
+remote; `bind` storage pays none of it. Three design rules follow, and the code sticks to them:
+
+- **Batch by default.** `serverFs` exposes `statMany`, `readdirMany`, `readMany` and
+  `readdirSized` (a listing, its per-entry sizes and per-child file probes in one exec) precisely
+  so a page costs one round trip rather than one per file. A new caller that loops over paths is a
+  bug on a remote host.
+- **Never walk when the index will do.** The size indexer already stores per-directory sizes;
+  pages that only display numbers (the metrics tab) read those instead of measuring live.
+- **Cache the repeated reads, briefly.** `server.properties` (2s) and the per-server world listing
+  (5s, dropped by every world operation) collapse a page render - and the reload behind it - into
+  one round trip.
+
+A new caller that ignores these reads as fast on a bind mount and crawls on a volume, which is why
+`serverFs` is the only door to a server's files.
 
 ## Key domain behaviors
 

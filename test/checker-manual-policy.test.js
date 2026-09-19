@@ -39,8 +39,8 @@ function seedPackServer(id, policy) {
 seedPackServer('srv_manual', 'manual');
 seedPackServer('srv_notify', 'notify');
 
-test('listOutdated hides manual-policy servers and keeps notify ones', () => {
-  const rows = listOutdated();
+test('listOutdated hides manual-policy servers and keeps notify ones', async () => {
+  const rows = await listOutdated();
   const byServer = rows.map((r) => r.serverId);
   assert.ok(byServer.includes('srv_notify'), 'notify server should be listed');
   assert.ok(!byServer.includes('srv_manual'), 'manual server must not be listed');

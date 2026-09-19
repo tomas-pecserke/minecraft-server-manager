@@ -12,6 +12,7 @@ const { nanoid } = require('nanoid');
 const db = require('../db');
 const config = require('../config');
 const { dataPath } = require('../storage/pathGuard');
+const serverFs = require('../storage/serverFs');
 const { recordEvent } = require('../events');
 const secrets = require('./secrets');
 const { pickJavaTag } = require('./javaMatrix');
@@ -147,7 +148,10 @@ function assembleEnv(server) {
   // ./data is owned by us. Otherwise it writes as its default uid (1000) and the
   // panel - a different user - can't manage those files (mod installs, deletes,
   // backups) and hits EACCES. This is the itzg image's intended ownership knob.
-  const ids = panelUidGid();
+  // Volume storage has no shared filesystem to agree about: the panel reaches
+  // those files as root through the sidecar, so pinning the container to the
+  // panel's own uid would only hand a meaningless id to another machine.
+  const ids = serverFs.isRemote() ? null : panelUidGid();
   if (ids) {
     env.UID = String(ids.uid);
     env.GID = String(ids.gid);
@@ -251,7 +255,9 @@ function previewServerSpec(id) {
       extra: server.extraPorts,
     },
     volumes: {
-      data: `${dataPath('servers', id)} -> /data`,
+      data: serverFs.isRemote()
+        ? `${require('../docker/volumes').volumeName(id)} (Docker volume) -> /data`
+        : `${dataPath('servers', id)} -> /data`,
       extra: server.extraBinds,
     },
     env,
@@ -369,7 +375,10 @@ async function createServerImpl(input, { actor = 'system', start = false, onProg
   const server = getServer(id);
 
   try {
-    fs.mkdirSync(dataPath('servers', id), { recursive: true });
+    // Volume storage keeps the server's files on the Docker host, so there is
+    // nothing to create here - createContainer makes the volume. The event log
+    // is panel-side either way.
+    if (!serverFs.isRemote()) fs.mkdirSync(dataPath('servers', id), { recursive: true });
     fs.mkdirSync(dataPath('logs', id, 'events'), { recursive: true });
 
     const image = resolveImage(server, { javaTagHint });
@@ -406,7 +415,10 @@ async function createServerImpl(input, { actor = 'system', start = false, onProg
     });
     db.run('DELETE FROM servers WHERE id = ?', id);
     try {
-      fs.rmSync(dataPath('servers', id), { recursive: true, force: true });
+      // Volume storage has no local directory; the volume (if it got as far as
+      // being created) goes with the container removal above.
+      if (serverFs.isRemote()) await require('../docker/volumes').removeVolume(id);
+      else fs.rmSync(dataPath('servers', id), { recursive: true, force: true });
     } catch {
       /* best effort */
     }
@@ -491,6 +503,17 @@ async function ensureOwnership(id) {
 async function startServerImpl(id, { actor = 'system' } = {}) {
   const server = mustGet(id);
   await ensureOwnership(id);
+  // A restore that crashed mid-swap parks the old files inside the volume;
+  // bind storage recovers that at boot (storage/dataRoot), a volume can only be
+  // reached through Docker, so the check happens here instead. Lazy require -
+  // backups requires this module back.
+  if (serverFs.isRemote()) {
+    await require('./backups')
+      .recoverDisplaced(id)
+      .catch((err) =>
+        logger.warn('Could not check for files left by an interrupted restore.', { serverId: id, err: err.message })
+      );
+  }
   const info = await containers.inspectStatus(id);
   if (!info.exists || server.pending_recreate) {
     await recreateServerImpl(id, { actor, quiet: true });
@@ -760,7 +783,16 @@ async function deleteServerImpl(id, { actor = 'system', keepWorld = true, keepBa
   await containers.removeContainer(id);
   let freedBytes = 0;
   const dir = dataPath('servers', id);
-  if (!keepWorld && fs.existsSync(dir)) {
+  if (!keepWorld && serverFs.isRemote()) {
+    // The files live in a volume on the Docker host; removing it is the delete.
+    freedBytes = (
+      await serverFs
+        .for(id)
+        .du()
+        .catch(() => ({ size: 0 }))
+    ).size;
+    await containers.removeDataDir(id, dir, resolveImage(server));
+  } else if (!keepWorld && fs.existsSync(dir)) {
     // Async, not dirSize()/rmSync() - a modded server's world+logs can be tens
     // of GB across tens of thousands of files, and the sync versions block the
     // event loop (every other request, every WebSocket console/stats stream)
@@ -774,7 +806,7 @@ async function deleteServerImpl(id, { actor = 'system', keepWorld = true, keepBa
       // panel runs as a different host user it can't delete them (EACCES/EPERM);
       // fall back to a root container that removes the directory for us.
       if (err.code === 'EACCES' || err.code === 'EPERM') {
-        await containers.removeDataDir(dir, resolveImage(server));
+        await containers.removeDataDir(id, dir, resolveImage(server));
         await fsp.rm(dir, { recursive: true, force: true }); // no-op if the container cleared it
       } else {
         throw err;
@@ -1122,21 +1154,20 @@ function unlockPropertyEnv(serverId, propKeys, { actor = 'system' } = {}) {
  * the revert-on-restart bug.
  * @returns {{ rebuildNeeded: boolean, unlocked: string[] }}
  */
-function writeServerProperties(serverId, content, { actor = 'system' } = {}) {
+async function writeServerProperties(serverId, content, { actor = 'system' } = {}) {
   if (!getServer(serverId)) throw httpError(404, 'Server not found');
-  let oldText = '';
-  try {
-    oldText = fs.readFileSync(dataPath('servers', serverId, 'server.properties'), 'utf8');
-  } catch {
-    /* fresh server - nothing to diff against */
-  }
+  // Through serverFs, never a path on this machine: the file belongs to the
+  // server, and with volume storage that server's data is on the Docker host.
+  const handle = serverFs.for(serverId);
+  const oldText = (await handle.readText('server.properties')) || ''; // fresh server - nothing to diff against
   const oldProps = parseProperties(oldText);
   const newProps = parseProperties(content);
   const changed = [...newProps.keys()].filter((key) => newProps.get(key) !== oldProps.get(key));
-  fs.mkdirSync(dataPath('servers', serverId), { recursive: true });
-  const tmp = dataPath('servers', serverId, 'server.properties.tmp');
-  fs.writeFileSync(tmp, content);
-  fs.renameSync(tmp, dataPath('servers', serverId, 'server.properties'));
+  // Write beside the file and rename over it, so a torn write can never leave
+  // the server with half a properties file.
+  await handle.writeFile('server.properties.tmp', content);
+  await handle.rename('server.properties.tmp', 'server.properties');
+  require('./worlds').forgetProps(serverId); // the parse is cached - see worlds.readProps
   const { removed, rebuildNeeded } = unlockPropertyEnv(serverId, changed, { actor });
   return { rebuildNeeded, unlocked: removed };
 }
@@ -1152,14 +1183,10 @@ function writeServerProperties(serverId, content, { actor = 'system' } = {}) {
  * beforehand, so the panel's own edits survive and only `key` changes.
  * @returns {{ rebuildNeeded: boolean, unlocked: string[] }}
  */
-function setServerProperty(serverId, key, value, { actor = 'system', baseText } = {}) {
+async function setServerProperty(serverId, key, value, { actor = 'system', baseText } = {}) {
   if (!getServer(serverId)) throw httpError(404, 'Server not found');
-  let text = '';
-  try {
-    text = baseText ?? fs.readFileSync(dataPath('servers', serverId, 'server.properties'), 'utf8');
-  } catch {
-    /* fresh server - create the file */
-  }
+  const text0 = baseText ?? (await serverFs.for(serverId).readText('server.properties'));
+  let text = text0 || ''; // fresh server - create the file
   const line = `${key}=${value}`;
   const re = new RegExp(`^${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=.*$`, 'm');
   if (re.test(text)) text = text.replace(re, () => line);

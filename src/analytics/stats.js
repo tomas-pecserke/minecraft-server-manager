@@ -4,10 +4,9 @@
 // snapshots (player_stat_snapshots), and derives profiles, scoreboards, and
 // the advisory X-ray report from them.
 
-const fsp = require('node:fs/promises');
 const path = require('node:path');
 const db = require('../db');
-const { dataPath } = require('../storage/pathGuard');
+const serverFs = require('../storage/serverFs');
 const serversService = require('../services/servers');
 const { activeLevelName } = require('../services/worlds');
 const { uuidToDashed } = require('../services/mojangProfiles');
@@ -73,8 +72,8 @@ function curate(root) {
 async function readUsercache(serverId) {
   const names = new Map();
   try {
-    const raw = await fsp.readFile(dataPath('servers', serverId, 'usercache.json'), 'utf8');
-    for (const row of JSON.parse(raw)) {
+    const raw = await serverFs.for(serverId).readJson('usercache.json');
+    for (const row of raw || []) {
       const uuid = uuidToDashed(row.uuid);
       if (uuid && row.name) names.set(uuid, row.name);
     }
@@ -82,15 +81,6 @@ async function readUsercache(serverId) {
     /* no usercache yet */
   }
   return names;
-}
-
-async function pathExists(p) {
-  try {
-    await fsp.access(p);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -112,20 +102,21 @@ async function ingestStats(serverId) {
   }
   // activeLevelName honors LEVEL env AND server.properties level-name - a
   // renamed/activated world would otherwise silently stop producing stats.
-  const level = activeLevelName(server);
+  const level = await activeLevelName(server);
   // MC 26.x moved stat files from <world>/stats to <world>/players/stats.
+  const handle = serverFs.for(serverId);
   let statsDir;
   try {
-    const modern = dataPath('servers', serverId, level, 'players', 'stats');
-    const legacy = dataPath('servers', serverId, level, 'stats');
-    statsDir = (await pathExists(modern)) ? modern : legacy;
+    const modern = `${level}/players/stats`;
+    const legacy = `${level}/stats`;
+    statsDir = (await handle.exists(modern)) ? modern : legacy;
   } catch {
     return { players: 0, snapshots: 0 };
   }
-  if (!(await pathExists(statsDir))) return { players: 0, snapshots: 0 };
+  if (!(await handle.exists(statsDir))) return { players: 0, snapshots: 0 };
 
   const names = await readUsercache(serverId);
-  const files = await fsp.readdir(statsDir);
+  const files = (await handle.readdir(statsDir)).map((e) => e.name);
   // First pass: read + curate every stat file (still async, yielding per file).
   const rows = [];
   for (const file of files) {
@@ -134,9 +125,11 @@ async function ingestStats(serverId) {
     if (!uuid) continue;
     let curated;
     try {
-      curated = curate(JSON.parse(await fsp.readFile(path.join(statsDir, file), 'utf8')));
+      const parsed = await handle.readJson(`${statsDir}/${file}`);
+      if (!parsed) continue; // missing, or caught mid-write - retry next cycle
+      curated = curate(parsed);
     } catch {
-      continue; // partial write / malformed file - retry next cycle
+      continue; // unreadable - retry next cycle
     }
     rows.push({ uuid, name: names.get(uuid) || '', json: JSON.stringify(curated) });
   }

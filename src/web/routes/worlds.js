@@ -182,7 +182,7 @@ serverWorlds.post(
       })
       .parse(req.body);
 
-    const warnings = worlds.copyWarnings(req.params.id, targetServerId);
+    const warnings = await worlds.copyWarnings(req.params.id, targetServerId);
     if (warnings.length && !confirm) {
       return res.json({ ok: true, requiresConfirm: true, warnings });
     }

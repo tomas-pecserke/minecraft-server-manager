@@ -41,7 +41,7 @@ function serverRow(id) {
   return { env: JSON.parse(row.env_json), pendingRecreate: row.pending_recreate };
 }
 
-test('pins an unpinned CurseForge server from its install manifest', () => {
+test('pins an unpinned CurseForge server from its install manifest', async () => {
   seedServer('srv_cfmani', 'AUTO_CURSEFORGE', { CF_SLUG: 'stoneblock-4' });
   writeManifest('srv_cfmani', '.curseforge-manifest.json', {
     slug: 'stoneblock-4',
@@ -52,7 +52,7 @@ test('pins an unpinned CurseForge server from its install manifest', () => {
     modpackName: 'StoneBlock 4',
   });
 
-  const result = pinUnpinnedServers();
+  const result = await pinUnpinnedServers();
   assert.ok(result.pinned >= 1);
   const { env, pendingRecreate } = serverRow('srv_cfmani');
   assert.equal(env.CF_FILE_ID, '5891234');
@@ -65,36 +65,36 @@ test('pins an unpinned CurseForge server from its install manifest', () => {
   assert.ok(event, 'expected a pack-pinned event');
 });
 
-test('pins from the panel server_packs record when there is no manifest', () => {
+test('pins from the panel server_packs record when there is no manifest', async () => {
   seedServer('srv_dbrec', 'MODRINTH', { MODRINTH_MODPACK: 'cobblemon' });
   db.run(
     `INSERT INTO server_packs (server_id, platform, project_ref, project_name, pinned_version_id, pinned_version_name)
      VALUES ('srv_dbrec', 'modrinth', 'cobblemon', 'Cobblemon', 'VeR51On1', '1.6.1')`
   );
-  pinUnpinnedServers();
+  await pinUnpinnedServers();
   assert.equal(serverRow('srv_dbrec').env.MODRINTH_VERSION, 'VeR51On1');
 });
 
-test('a manifest for a different pack is not trusted', () => {
+test('a manifest for a different pack is not trusted', async () => {
   seedServer('srv_wrong', 'AUTO_CURSEFORGE', { CF_SLUG: 'all-the-mods-10' });
   writeManifest('srv_wrong', '.curseforge-manifest.json', { slug: 'some-other-pack', fileId: 99 });
-  const result = pinUnpinnedServers();
+  const result = await pinUnpinnedServers();
   assert.equal(serverRow('srv_wrong').env.CF_FILE_ID, undefined);
   assert.ok(result.unresolved >= 1);
 });
 
-test('pins an unpinned Modrinth server from its install manifest', () => {
+test('pins an unpinned Modrinth server from its install manifest', async () => {
   seedServer('srv_mrmani', 'MODRINTH', { MODRINTH_MODPACK: 'fabulously-optimized' });
   writeManifest('srv_mrmani', '.modrinth-manifest.json', {
     projectSlug: 'fabulously-optimized',
     versionId: 'aBc123Xy',
   });
-  pinUnpinnedServers();
+  await pinUnpinnedServers();
   assert.equal(serverRow('srv_mrmani').env.MODRINTH_VERSION, 'aBc123Xy');
 });
 
-test('the sweep is idempotent: a second run finds nothing to do', () => {
-  const result = pinUnpinnedServers();
+test('the sweep is idempotent: a second run finds nothing to do', async () => {
+  const result = await pinUnpinnedServers();
   assert.equal(result.pinned, 0);
   // srv_wrong stays unresolved (still unpinned, still no usable evidence).
   assert.equal(result.unresolved, 1);

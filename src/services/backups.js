@@ -14,6 +14,8 @@ const yauzl = require('yauzl');
 const { nanoid } = require('nanoid');
 const db = require('../db');
 const { dataPath } = require('../storage/pathGuard');
+const serverFs = require('../storage/serverFs');
+const sidecar = require('../docker/sidecar');
 const { recordEvent } = require('../events');
 const { execCapture, inspectStatus } = require('../docker/containers');
 const indexer = require('../storage/indexer');
@@ -38,8 +40,11 @@ async function createBackupImpl(
   const server = db.get('SELECT * FROM servers WHERE id = ? AND deleted_at IS NULL', serverId);
   if (!server) throw httpError(404, 'Server not found');
 
-  // Free-space preflight: need roughly the server dir size.
-  const needed = indexer.sizeOf(`servers/${serverId}`) || 0;
+  // Free-space preflight: need roughly the server dir size. The archive always
+  // lands on the panel's disk, even when the server's files are on another
+  // host - which is the point: backups live where the panel can prune and serve
+  // them, and never take space on the Docker host.
+  const needed = await serverSizeBytes(serverId);
   const { free } = await indexer.diskFree();
   if (needed && free < needed * 1.1) {
     throw httpError(507, `Not enough disk space for a backup (~${(needed / 1024 ** 3).toFixed(1)} GB needed)`);
@@ -58,7 +63,7 @@ async function createBackupImpl(
 
   const archive = async () => {
     if (task) task.step('Compressing server files…');
-    await zipDirectory(dataPath('servers', serverId), absPath, {
+    await zipServerData(serverId, absPath, {
       onProgress: task ? (processedBytes) => task.progress(processedBytes, needed) : null,
     });
   };
@@ -231,7 +236,7 @@ async function restoreBackupImpl(serverId, backupId, { actor = 'system', skipSaf
   const zipStat = await fsp.stat(zipPath).catch(() => null);
   if (!zipStat) throw httpError(404, `Backup archive is missing on disk: ${backup.filename}`);
   const uncompressedBytes = await zipUncompressedSize(zipPath).catch(() => zipStat.size * 4);
-  const safetyBytes = skipSafety ? 0 : indexer.sizeOf(`servers/${serverId}`) || 0;
+  const safetyBytes = skipSafety ? 0 : await serverSizeBytes(serverId);
   const needed = uncompressedBytes + safetyBytes;
   const { free } = await indexer.diskFree();
   if (free < needed * 1.1) {
@@ -294,6 +299,18 @@ async function restoreBackupImpl(serverId, backupId, { actor = 'system', skipSaf
     } catch (err) {
       await fsp.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
       throw err; // original serverDir was never touched
+    }
+
+    // Volume storage: the live files are on the Docker host, so the swap
+    // happens there - park them inside the volume, upload the extracted copy,
+    // then drop the parked one. Same shape as the rename dance below, and the
+    // parked directory is likewise what a crash mid-swap leaves to recover from.
+    if (serverFs.isRemote()) {
+      await swapVolumeContents(serverId, stagingDir);
+      await fsp.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
+      recordEvent({ serverId, actor, type: 'backup-restored', summary: `Restored backup ${backup.filename}.` });
+      indexer.scheduleScan();
+      return { ok: true };
     }
 
     // The displaced world stays a SIBLING of serverDir (same filesystem, so the
@@ -498,14 +515,29 @@ async function pruneRetention(serverId, { actor = 'system' } = {}) {
   return deleted;
 }
 
+/**
+ * Zip a server's files into outFile. Bind storage reads the directory; volume
+ * storage streams the files out of the Docker host through the file sidecar,
+ * which the panel holds open for as long as the worker runs.
+ */
+async function zipServerData(serverId, outFile, { onProgress = null } = {}) {
+  if (!serverFs.isRemote()) return zipDirectory(dataPath('servers', serverId), outFile, { onProgress });
+  const container = await sidecar.acquire(serverId);
+  try {
+    return await zipDirectory(null, outFile, { onProgress, sidecarContainer: container.id });
+  } finally {
+    sidecar.release(serverId);
+  }
+}
+
 // Compression runs in a worker thread (src/services/backupZipWorker.js) so the
 // deflate CPU + archiver framing for a multi-GB world don't stall every other
 // request. The worker deletes its own half-written .zip on failure.
-function zipDirectory(sourceDir, outFile, { onProgress = null } = {}) {
+function zipDirectory(sourceDir, outFile, { onProgress = null, sidecarContainer = null } = {}) {
   /** @type {Promise<void>} */
   const p = new Promise((resolve, reject) => {
     const worker = new Worker(path.join(__dirname, 'backupZipWorker.js'), {
-      workerData: { sourceDir, outFile },
+      workerData: { sourceDir, outFile, sidecarContainer },
     });
     let settled = false;
     const done = (fn, arg) => {
@@ -575,6 +607,113 @@ function zipEntryCount(zipFile) {
 }
 
 /** Rename a directory, falling back to copy+remove across devices (EXDEV). */
+/**
+ * Replace a volume's contents with a directory extracted on the panel. The
+ * current files are parked in a sibling directory inside the same volume first,
+ * so a failed upload can put them straight back.
+ */
+// Written inside the parked directory once the new files are all in place.
+// Without it, a crash between "files uploaded" and "parked copy removed" is
+// indistinguishable from a crash midway through the upload - and the two want
+// opposite recoveries, one to drop the parked copy and one to put it back.
+const RESTORE_DONE_MARKER = '.msm-restore-complete';
+
+async function swapVolumeContents(serverId, stagingDir) {
+  const handle = serverFs.for(serverId);
+  const parked = `.restore-displaced-${Date.now().toString(36)}`;
+  const park = `set -e; mkdir -p /data/${parked}; find /data -mindepth 1 -maxdepth 1 ! -name '${parked}' -exec mv -t /data/${parked} {} +`;
+  const unpark =
+    `find /data -mindepth 1 -maxdepth 1 ! -name '${parked}' -exec rm -rf {} +; ` +
+    `find /data/${parked} -mindepth 1 -maxdepth 1 -exec mv -t /data {} +; rmdir /data/${parked}`;
+
+  const parkResult = await sidecar.exec(serverId, ['sh', '-c', park], { timeoutMs: 300000 });
+  if (parkResult.exitCode !== 0) {
+    throw httpError(500, 'The server files could not be set aside for the restore, so nothing was changed.');
+  }
+  try {
+    await handle.uploadDir(stagingDir, '');
+  } catch (err) {
+    await sidecar.exec(serverId, ['sh', '-c', unpark], { timeoutMs: 300000 }).catch(() => {});
+    throw err;
+  }
+  // Mark BEFORE removing: from here on the parked copy is spare, and a crash
+  // must not send recovery back to it over a finished restore.
+  await handle.writeFile(`${parked}/${RESTORE_DONE_MARKER}`, '');
+  await handle.remove(parked).catch(() => {});
+}
+
+/**
+ * Put back files a crashed restore left parked inside a volume. Mirrors the
+ * boot-time recovery ensureDataRoot does for bind storage: parked files that
+ * are all that's left go back, leftovers from a completed restore are removed.
+ */
+async function recoverDisplaced(serverId) {
+  if (!serverFs.isRemote()) return;
+  const handle = serverFs.for(serverId);
+  const entries = await handle.readdir('').catch(() => []);
+  // Oldest first: the earliest parked copy is the one holding the state from
+  // before the restore, whatever happened after it.
+  const parked = entries
+    .filter((e) => e.dir && e.name.startsWith('.restore-displaced-'))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  if (!parked.length) return;
+
+  const markers = await handle.statMany(parked.map((dir) => `${dir.name}/${RESTORE_DONE_MARKER}`));
+  let rolledBack = false;
+  for (const [index, dir] of parked.entries()) {
+    if (markers[index]) {
+      // That restore finished; this copy is spare.
+      await handle.remove(dir.name).catch(() => {});
+      logger.info('Removed leftover files from a completed restore.', { serverId });
+      continue;
+    }
+    if (rolledBack) {
+      // Something we cannot reason about - two interrupted restores. The files
+      // stay where they are rather than being deleted on a guess.
+      logger.warn('Found more files parked by an interrupted restore than expected; left them in place.', {
+        serverId,
+        directory: dir.name,
+      });
+      continue;
+    }
+    // The restore never finished, so whatever is in /data is a half-written
+    // copy: drop it and put the parked files back.
+    const rollBack =
+      `find /data -mindepth 1 -maxdepth 1 ! -name '.restore-displaced-*' -exec rm -rf {} +; ` +
+      `find /data/${dir.name} -mindepth 1 -maxdepth 1 -exec mv -t /data {} +; rmdir /data/${dir.name}`;
+    const res = await sidecar.exec(serverId, ['sh', '-c', rollBack], { timeoutMs: 300000 });
+    if (res.exitCode !== 0) {
+      logger.error('Could not put back the files a crashed restore left parked.', {
+        serverId,
+        directory: dir.name,
+        err: res.stderr.trim(),
+      });
+      continue;
+    }
+    rolledBack = true;
+    logger.warn(
+      'Recovered files displaced by a restore that crashed mid-swap. The restore did not complete; the files from before it are back in place.',
+      { serverId }
+    );
+  }
+}
+
+/**
+ * Size of a server's files. The index is the fast path; a server on another
+ * host that the indexer hasn't measured yet is asked directly, which is a
+ * single du inside its sidecar.
+ */
+async function serverSizeBytes(serverId) {
+  const indexed = indexer.sizeOf(`servers/${serverId}`) || 0;
+  if (indexed || !serverFs.isRemote()) return indexed;
+  return (
+    await serverFs
+      .for(serverId)
+      .du()
+      .catch(() => ({ size: 0 }))
+  ).size;
+}
+
 async function renameDir(from, to) {
   try {
     await fsp.rename(from, to);
@@ -590,6 +729,7 @@ function sleep(ms) {
 }
 
 module.exports = {
+  recoverDisplaced,
   createBackup,
   createBackupUnguarded: createBackupImpl,
   restoreBackup,

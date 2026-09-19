@@ -6,12 +6,11 @@
 const asyncHandler = require('../middleware/asyncHandler');
 const { makeJsonErrorHandler } = require('../middleware/jsonErrorHandler');
 const express = require('express');
-const fs = require('node:fs');
 const path = require('node:path');
 const archiver = require('archiver');
 const { z } = require('zod');
 const crashes = require('../../crashes');
-const { dataPath } = require('../../storage/pathGuard');
+const serverFs = require('../../storage/serverFs');
 const logger = require('../../logger')('crashes');
 const { serializeError } = require('../../utils/logSanitize');
 
@@ -40,7 +39,7 @@ router.get(
 // Must be declared before /:crashId routes.
 router.get(
   '/export.zip',
-  asyncHandler((req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     const serverId = serverIdSchema.parse(req.params.id);
     const rows = crashes.listCrashes(serverId);
 
@@ -53,11 +52,13 @@ router.get(
       res.destroy();
     });
     archive.pipe(res);
+    const handle = serverFs.for(serverId);
     for (const row of rows) {
-      const abs = row.filename.startsWith('hs_err')
-        ? dataPath('servers', serverId, row.filename)
-        : dataPath('servers', serverId, 'crash-reports', row.filename);
-      if (fs.existsSync(abs)) archive.file(abs, { name: path.basename(row.filename) });
+      const rel = row.filename.startsWith('hs_err') ? row.filename : `crash-reports/${row.filename}`;
+      // Streamed rather than added by path: the files may live on the Docker
+      // host, where this process has no path to hand archiver.
+      const stream = await handle.readStream(rel).catch(() => null);
+      if (stream) archive.append(stream, { name: path.basename(row.filename) });
     }
     archive.finalize();
   })
@@ -66,10 +67,10 @@ router.get(
 // Bulk delete - everything older than ?olderThanDays=N for this server.
 router.delete(
   '/',
-  asyncHandler((req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     const serverId = serverIdSchema.parse(req.params.id);
     const days = z.coerce.number().int().min(1).max(3650).parse(req.query.olderThanDays);
-    const result = crashes.deleteOlderThan(serverId, days, { actor: req.user.username });
+    const result = await crashes.deleteOlderThan(serverId, days, { actor: req.user.username });
     res.json({ ok: true, ...result });
   })
 );
@@ -113,9 +114,9 @@ router.post(
 
 router.delete(
   '/:crashId',
-  asyncHandler((req, res, next) => {
+  asyncHandler(async (req, res, next) => {
     const row = ownedCrash(req);
-    const { freedBytes } = crashes.deleteCrash(row.id, { actor: req.user.username });
+    const { freedBytes } = await crashes.deleteCrash(row.id, { actor: req.user.username });
     res.json({ ok: true, freedBytes });
   })
 );

@@ -4,15 +4,46 @@ const httpError = require('../utils/httpError');
 
 // Host-port allocation. Scheme (user-approved): game ports first-free from
 // 25565, RCON = game + 1000, Bedrock UDP first-free from 19132. A port is
-// "taken" if any DB server claims it OR the OS reports it in use.
+// "taken" if any DB server claims it OR it is already bound where the
+// containers actually run - this machine for a local daemon, the daemon host
+// (as far as its own containers show) for a remote one.
 
 const net = require('node:net');
 const db = require('../db');
 const config = require('../config');
 
+// Ports already published by containers on the daemon's host. With a remote
+// daemon this is the only view of "taken" we have - binding a socket here says
+// nothing about a machine somewhere else, and a collision would otherwise only
+// surface as a failed start. Cached for a few seconds because a port search
+// asks about many candidates in a row.
+let daemonPorts = { at: 0, ports: new Set() };
+const DAEMON_PORTS_TTL_MS = 5000;
+
+async function daemonPortsInUse() {
+  if (Date.now() - daemonPorts.at < DAEMON_PORTS_TTL_MS) return daemonPorts.ports;
+  const ports = new Set();
+  try {
+    // Running containers only: a stopped one holds nothing, and the panel's own
+    // stopped servers are already covered by dbPortsInUse().
+    // Lazily required so the docker layer stays swappable (and out of this
+    // module's load-time graph).
+    for (const c of await require('../docker/connect').getDocker().listContainers()) {
+      for (const p of c.Ports || []) if (p.PublicPort) ports.add(p.PublicPort);
+    }
+  } catch {
+    return daemonPorts.ports; // daemon down - keep the last answer rather than claiming everything is free
+  }
+  daemonPorts = { at: Date.now(), ports };
+  return ports;
+}
+
 /** OS availability probe. Bounded by a timeout so a wedged bind/close can't
  *  leave the caller (and a server create) hanging forever. */
-function probe(port, host = '0.0.0.0', timeoutMs = 2000) {
+async function probe(port, host = '0.0.0.0', timeoutMs = 2000) {
+  // A remote daemon publishes ports on ITS host; binding one here would prove
+  // nothing and would happily hand out a port that is already taken there.
+  if (config.dockerRemote) return !(await daemonPortsInUse()).has(port);
   return new Promise((resolve) => {
     const srv = net.createServer();
     srv.unref();
@@ -110,4 +141,4 @@ async function suggestPorts({ withBedrock = false } = {}) {
   return result;
 }
 
-module.exports = { isPortFree, suggestPorts, probe, dbPortsInUse };
+module.exports = { isPortFree, suggestPorts, probe, dbPortsInUse, daemonPortsInUse };

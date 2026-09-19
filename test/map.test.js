@@ -19,13 +19,13 @@ function setLevelName(id, name) {
   fs.writeFileSync(dataPath('servers', id, 'server.properties'), `level-name=${name}\n`);
 }
 
-test('writeMapConfigs points a fresh world.conf at a custom level-name, and skips missing dims', () => {
+test('writeMapConfigs points a fresh world.conf at a custom level-name, and skips missing dims', async () => {
   const id = app.seedServer('srv_bmA');
   db.run("UPDATE servers SET type = 'PAPER' WHERE id = ?", id);
   setLevelName(id, 'myworld');
   fs.mkdirSync(dataPath('servers', id, 'myworld'), { recursive: true }); // the ACTUAL world folder
 
-  map.writeMapConfigs(id);
+  await map.writeMapConfigs(id);
 
   const dir = mapsDirFor(id);
   const overworld = fs.readFileSync(`${dir}/world.conf`, 'utf8');
@@ -36,7 +36,7 @@ test('writeMapConfigs points a fresh world.conf at a custom level-name, and skip
   assert.equal(fs.existsSync(`${dir}/world_the_end.conf`), false);
 });
 
-test('writeMapConfigs surgically patches a stale world: line, preserving everything else BlueMap/the admin set', () => {
+test('writeMapConfigs surgically patches a stale world: line, preserving everything else BlueMap/the admin set', async () => {
   const id = app.seedServer('srv_bmB');
   db.run("UPDATE servers SET type = 'PAPER' WHERE id = ?", id);
   setLevelName(id, 'survival');
@@ -51,7 +51,7 @@ test('writeMapConfigs surgically patches a stale world: line, preserving everyth
     'world: "world"\ndimension: "minecraft:overworld"\nname: "My Cool Map"\nsky-color: "#123456"\n'
   );
 
-  map.writeMapConfigs(id);
+  await map.writeMapConfigs(id);
 
   const text = fs.readFileSync(`${dir}/world.conf`, 'utf8');
   assert.match(text, /^world: "survival"$/m);
@@ -60,17 +60,17 @@ test('writeMapConfigs surgically patches a stale world: line, preserving everyth
   assert.match(text, /sky-color: "#123456"/);
 });
 
-test('writeMapConfigs is a no-op rewrite once the world: line already matches', () => {
+test('writeMapConfigs is a no-op rewrite once the world: line already matches', async () => {
   const id = app.seedServer('srv_bmC');
   db.run("UPDATE servers SET type = 'PAPER' WHERE id = ?", id);
   fs.mkdirSync(dataPath('servers', id, 'world'), { recursive: true });
 
-  map.writeMapConfigs(id);
+  await map.writeMapConfigs(id);
   const dir = mapsDirFor(id);
   const before = fs.readFileSync(`${dir}/world.conf`, 'utf8');
   const beforeMtime = fs.statSync(`${dir}/world.conf`).mtimeMs;
 
-  map.writeMapConfigs(id); // second call, same state
+  await map.writeMapConfigs(id); // second call, same state
   const after = fs.readFileSync(`${dir}/world.conf`, 'utf8');
   assert.equal(after, before);
   // mtime is a weak signal on fast filesystems, so just assert content
@@ -78,14 +78,14 @@ test('writeMapConfigs is a no-op rewrite once the world: line already matches', 
   assert.ok(fs.statSync(`${dir}/world.conf`).mtimeMs >= beforeMtime);
 });
 
-test('writeMapConfigs writes nether/end configs only when those dimension folders already exist', () => {
+test('writeMapConfigs writes nether/end configs only when those dimension folders already exist', async () => {
   const id = app.seedServer('srv_bmD');
   db.run("UPDATE servers SET type = 'PAPER' WHERE id = ?", id);
   fs.mkdirSync(dataPath('servers', id, 'world'), { recursive: true });
   fs.mkdirSync(dataPath('servers', id, 'world_nether'), { recursive: true });
   // world_the_end intentionally absent - nobody has visited the End yet.
 
-  map.writeMapConfigs(id);
+  await map.writeMapConfigs(id);
 
   const dir = mapsDirFor(id);
   assert.match(fs.readFileSync(`${dir}/world_nether.conf`, 'utf8'), /world: "world_nether"/);
@@ -93,12 +93,12 @@ test('writeMapConfigs writes nether/end configs only when those dimension folder
   assert.equal(fs.existsSync(`${dir}/world_the_end.conf`), false);
 });
 
-test('a modded (non-Paper-family) server writes its maps config under config/bluemap, not plugins/BlueMap', () => {
+test('a modded (non-Paper-family) server writes its maps config under config/bluemap, not plugins/BlueMap', async () => {
   const id = app.seedServer('srv_bmE');
   db.run("UPDATE servers SET type = 'FABRIC' WHERE id = ?", id);
   fs.mkdirSync(dataPath('servers', id, 'world'), { recursive: true });
 
-  map.writeMapConfigs(id);
+  await map.writeMapConfigs(id);
 
   const dir = dataPath('servers', id, 'config', 'bluemap', 'maps');
   assert.equal(fs.existsSync(`${dir}/world.conf`), true);
@@ -118,7 +118,7 @@ test('switching the active world (worlds.activateWorld) refreshes BlueMap when i
     id,
     JSON.stringify({ hostPort: 28300 })
   );
-  map.writeMapConfigs(id); // simulate the map having been enabled while "world" was active
+  await map.writeMapConfigs(id); // simulate the map having been enabled while "world" was active
 
   await worlds.activateWorld(id, 'creative');
 
@@ -140,7 +140,7 @@ test('switching the active world does NOT touch BlueMap configs when the map is 
   assert.equal(fs.existsSync(mapsDirFor(id)), false);
 });
 
-test('writeMapConfigs strips quotes and newlines from the level name (no HOCON string break-out via LEVEL)', () => {
+test('writeMapConfigs strips quotes and newlines from the level name (no HOCON string break-out via LEVEL)', async () => {
   const id = app.seedServer('srv_bmInj');
   db.run("UPDATE servers SET type = 'PAPER' WHERE id = ?", id);
   // A hostile LEVEL env value with the two chars that could break out of the
@@ -148,7 +148,7 @@ test('writeMapConfigs strips quotes and newlines from the level name (no HOCON s
   db.run('UPDATE servers SET env_json = ? WHERE id = ?', JSON.stringify({ LEVEL: 'my"\nevil world' }), id);
   fs.mkdirSync(dataPath('servers', id, 'myevil world'), { recursive: true });
 
-  map.writeMapConfigs(id);
+  await map.writeMapConfigs(id);
 
   const conf = fs.readFileSync(`${mapsDirFor(id)}/world.conf`, 'utf8');
   assert.match(conf, /^world: "myevil world"$/m, 'the " and newline are gone; the rest is kept verbatim');

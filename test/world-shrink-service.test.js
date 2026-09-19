@@ -137,7 +137,9 @@ test('vanilla/Forge sub-dimensions (DIM-1, DIM1, dimensions/*) are shrunk too, w
     fs.writeFileSync(path.join(world, sub, 'region', 'r.0.0.mca'), makeRegion({ 0: 1 })); // same slot, no protection here
   }
   const r = await shrinkWorld(SID, { worldName: 'w_dims' });
-  assert.deepEqual(r.dimensions.sort(), ['.', 'DIM-1', 'DIM1', path.join('dimensions', 'mymod', 'void')].sort());
+  // Reported with forward slashes on every platform - these names travel into
+  // the history summary, not into a filesystem call.
+  assert.deepEqual(r.dimensions.sort(), ['.', 'DIM-1', 'DIM1', 'dimensions/mymod/void'].sort());
   assert.equal(r.chunksRemoved, 3, 'the three sub-dimension chunks went, the overworld spawn chunk stayed');
   assert.equal(fs.existsSync(path.join(world, 'region', 'r.0.0.mca')), true);
   assert.equal(fs.existsSync(path.join(world, 'DIM-1', 'region', 'r.0.0.mca')), false);

@@ -51,6 +51,10 @@ function installRuntimeGuards() {
   process.on('unhandledRejection', (reason) => report('rejection', reason));
 }
 
+// The boot-time modpack-pin repair, so the auto-start sweep in
+// startBackgroundServices can wait for it instead of racing it.
+let pinSweep = Promise.resolve();
+
 try {
   const config = require('./config');
   const { ensureDataRoot } = require('./storage/dataRoot');
@@ -87,11 +91,12 @@ try {
   // Servers from before 0.9.7 (or with hand-edited env) can still carry an
   // unpinned modpack selector, which silently auto-updates on every start
   // (#22). Pin them to what's already installed; no-op once repaired.
-  try {
-    require('./services/packPins').pinUnpinnedServers();
-  } catch (err) {
-    logger.error('The unpinned-modpack sweep failed.', { err: serializeError(err) });
-  }
+  // Reads each server's installed manifest, so it is asynchronous; the
+  // auto-start sweep below waits on it rather than racing a server up on an
+  // unpinned selector.
+  pinSweep = require('./services/packPins')
+    .pinUnpinnedServers()
+    .catch((err) => logger.error('The unpinned-modpack sweep failed.', { err: serializeError(err) }));
 
   require('./blueprints')
     .seedStarters()
@@ -276,6 +281,7 @@ function startBackgroundServices(httpServer) {
   // when the daemon is down (setup wizard handles that state).
   (async () => {
     const { checkDocker } = require('./docker/connect');
+    const { serverStorage } = require('./config');
     const status = await checkDocker();
     if (!status.available) {
       logger.warn('Docker is not reachable. Server start, stop, and create stay disabled until it comes up.', {
@@ -283,7 +289,12 @@ function startBackgroundServices(httpServer) {
       });
       return;
     }
-    logger.info('Connected to Docker.', { os: status.os, version: status.version });
+    logger.info('Connected to Docker.', { os: status.os, version: status.version, serverStorage });
+    if (serverStorage === 'volume') {
+      await require('./docker/sidecar')
+        .pruneOrphans()
+        .catch((err) => logger.warn('Could not clear file sidecars from a previous run.', { err: err.message }));
+    }
     const { startWatcher } = require('./docker/watcher');
     const serversService = require('./services/servers');
     await startWatcher().catch((err) =>
@@ -311,6 +322,7 @@ function startBackgroundServices(httpServer) {
     // panel was down: the live docker-events watcher never saw that 'die', so
     // nothing scheduled the auto-restart for them. guardOp de-dupes a server
     // that matches both conditions.
+    await pinSweep; // never rejects - it swallows its own failure
     const { inCrashLoopBackoff } = require('./docker/watcher');
     for (const s of serversService.listServers()) {
       const autoStart = s.auto_start && !['running', 'starting'].includes(s.status);

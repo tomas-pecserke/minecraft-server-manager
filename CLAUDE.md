@@ -53,7 +53,8 @@ docker/  ·  db/  ·  storage/     (infrastructure)
   `routes/apiV1.js` (`/api/v1`, read-only JSON, Bearer-token auth, off by default).
 - **`src/services/`** — the heart of the app; each service owns one domain.
 - **`src/docker/`** — dockerode wrappers: `connect` (endpoint auto-detected per-OS), `containers`,
-  `logs`, `stats`, `images`, and `watcher` (turns Docker events into history + crash detection).
+  `logs`, `stats`, `images`, `volumes` + `sidecar` (the per-server file container that backs
+  volume storage), and `watcher` (turns Docker events into history + crash detection).
 - **`src/db/`** — [`src/db/index.js`](src/db/index.js) is the **only** module that touches the
   driver (`node:sqlite`, synchronous, WAL, prepared-statement cache keyed on SQL text). API:
   `run / get / all / exec / transaction(fn) / backupTo`. Schema changes = a new numbered file in
@@ -75,6 +76,10 @@ allocation, disk quotas, at-rest secret encryption), and wire formats are all de
 1. **Never touch the filesystem under `./data` directly.** Resolve every path through the path guard
    in `src/storage/` (`safeJoin` / `dataPath`). It rejects anything escaping the data root — this is
    the backbone of the file-safety story. Uploads and archive extraction are additionally size-capped.
+   **A server's own files go through `src/storage/serverFs.js`**, always async and always by a path
+   relative to that server: with `SERVER_STORAGE=volume` (the default against a remote
+   `DOCKER_HOST`) they live in a Docker volume on another machine and there is no local path at all.
+   Readers that need a real file (NBT, zip) use `withLocalCopy` / `withLocalDir`.
 2. **Mid-function `require()` calls are intentional cycle-breakers.** If you see
    `const x = require('...')` inside a function body, it's avoiding a circular dependency at load
    time. Don't hoist it to the top without checking for the cycle.

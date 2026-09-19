@@ -9,7 +9,15 @@
 const httpError = require('../utils/httpError');
 const fs = require('node:fs');
 const { dataPath } = require('../storage/pathGuard');
-const { recordEvent } = require('../events');
+const serverFs = require('../storage/serverFs');
+const { recordEvent: recordEventRaw } = require('../events');
+
+// Changes made over RCON are written to the files by the server itself, so the
+// events this module records are the reliable signal that the roster moved.
+function recordEvent(event) {
+  if (event && event.serverId) forgetRoster(event.serverId);
+  return recordEventRaw(event);
+}
 const { execCapture } = require('../docker/containers');
 const mojangProfiles = require('./mojangProfiles');
 const servers = require('./servers');
@@ -75,25 +83,38 @@ function prettyDimension(dim) {
 // ---------------------------------------------------------------------------
 // JSON file helpers (atomic writes: tmp file + rename)
 
-function readJson(serverId, file) {
+/** readJson for several of the player files at once - one round trip. */
+async function readJsonMany(serverId, files) {
+  for (const file of files) {
+    if (!FILES.has(file)) throw httpError(400, `Unsupported player file: ${file}`);
+  }
+  try {
+    const parsed = await serverFs.for(serverId).readJsonMany(files);
+    return parsed.map((value) => (Array.isArray(value) ? value : []));
+  } catch {
+    throw httpError(500, 'Could not read the player files on the server.');
+  }
+}
+
+async function readJson(serverId, file) {
   if (!FILES.has(file)) throw httpError(400, `Unsupported player file: ${file}`);
   try {
-    const raw = fs.readFileSync(dataPath('servers', serverId, file), 'utf8');
-    const parsed = JSON.parse(raw);
+    const parsed = await serverFs.for(serverId).readJson(file);
     return Array.isArray(parsed) ? parsed : [];
-  } catch (err) {
-    if (err.code === 'ENOENT') return [];
+  } catch {
     throw httpError(500, 'Could not read that player file on the server.');
   }
 }
 
-function writeJson(serverId, file, data) {
+async function writeJson(serverId, file, data) {
   if (!FILES.has(file)) throw httpError(400, `Unsupported player file: ${file}`);
-  const target = dataPath('servers', serverId, file);
-  const tmp = dataPath('servers', serverId, `${file}.${process.pid}-${Date.now()}.tmp`);
-  fs.mkdirSync(dataPath('servers', serverId), { recursive: true });
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
-  fs.renameSync(tmp, target);
+  forgetRoster(serverId); // whatever we are about to write, the cached view is stale
+  const handle = serverFs.for(serverId);
+  // Write beside the file and rename over it: a torn whitelist or ops file
+  // would silently drop everyone on it.
+  const tmp = `${file}.${process.pid}-${Date.now()}.tmp`;
+  await handle.writeFile(tmp, JSON.stringify(data, null, 2) + '\n');
+  await handle.rename(tmp, file);
 }
 
 // ---------------------------------------------------------------------------
@@ -181,10 +202,11 @@ function isBanExpired(expires) {
 // the name resolves through Mojang instead.
 const UUID_RE = /^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$/;
 
-function localIdentity(serverId, name) {
+async function localIdentity(serverId, name) {
   const lower = name.toLowerCase();
-  for (const file of ['usercache.json', 'whitelist.json', 'ops.json', 'banned-players.json']) {
-    const hit = readJson(serverId, file).find(
+  const files = ['usercache.json', 'whitelist.json', 'ops.json', 'banned-players.json'];
+  for (const entries of await readJsonMany(serverId, files)) {
+    const hit = entries.find(
       (e) => e.name && e.name.toLowerCase() === lower && typeof e.uuid === 'string' && UUID_RE.test(e.uuid)
     );
     if (hit) return { uuid: hit.uuid, name: hit.name };
@@ -195,7 +217,7 @@ function localIdentity(serverId, name) {
 /** Resolve a name to {uuid, name}: server files first, Mojang API second. */
 async function resolveIdentity(serverId, name) {
   assertName(name);
-  const local = localIdentity(serverId, name);
+  const local = await localIdentity(serverId, name);
   if (local) return local;
   let profile;
   try {
@@ -218,7 +240,7 @@ async function resolveIdentity(serverId, name) {
  * @param {string} serverId
  * @param {string[]} onlineNames  live names from `list` (caller-provided)
  */
-function listPlayers(serverId, onlineNames = []) {
+async function listPlayers(serverId, onlineNames = [], files = null) {
   const entries = [];
   const byUuid = new Map();
   const byName = new Map(); // lowercase name - dedupes uuid-less `list` names
@@ -257,16 +279,20 @@ function listPlayers(serverId, onlineNames = []) {
     Object.assign(entry, patch);
   };
 
-  for (const e of readJson(serverId, 'usercache.json')) {
+  // One call for all four role files: on a server whose files live on another
+  // host, reading them one by one is a round trip each and the tab crawls.
+  const [usercache, whitelist, ops, bans] =
+    files || (await readJsonMany(serverId, ['usercache.json', 'whitelist.json', 'ops.json', 'banned-players.json']));
+  for (const e of usercache) {
     upsert(e.name, e.uuid, { lastSeen: e.expiresOn || null });
   }
-  for (const e of readJson(serverId, 'whitelist.json')) {
+  for (const e of whitelist) {
     upsert(e.name, e.uuid, { whitelisted: true });
   }
-  for (const e of readJson(serverId, 'ops.json')) {
+  for (const e of ops) {
     upsert(e.name, e.uuid, { op: true, opLevel: e.level ?? 4, bypassesPlayerLimit: Boolean(e.bypassesPlayerLimit) });
   }
-  for (const e of readJson(serverId, 'banned-players.json')) {
+  for (const e of bans) {
     // An expired entry still sits in the file until the sweep sees it (or vanilla's
     // own check on connect) - display it as pardoned rather than confusingly "banned".
     const expired = isBanExpired(e.expires);
@@ -287,8 +313,93 @@ function listPlayers(serverId, onlineNames = []) {
   );
 }
 
-function listBannedIps(serverId) {
-  return readJson(serverId, 'banned-ips.json')
+/**
+ * Everything the players tab shows, from ONE read of the server's files: the
+ * roster, the IP bans and whether the whitelist is enforced. Asking for them
+ * separately is a round trip each, which a server on another host feels.
+ */
+// Same story as the mods listing: the tab renders server-side and the browser
+// immediately asks for the same thing. Held briefly, dropped by every write.
+const rosterCache = new Map(); // serverId -> { at, view }
+const ROSTER_TTL_MS = 3000;
+
+/** Drop a server's cached roster (after anything that writes a player file). */
+function forgetRoster(serverId) {
+  rosterCache.delete(serverId);
+}
+
+/**
+ * Who is online, without asking the server again when the live poller already
+ * knows. It refreshes every 20 seconds in the background; a page that runs its
+ * own `list` over RCON pays a round trip for an answer already in hand.
+ */
+async function onlineNames(serverId) {
+  const live = require('./liveCache').get(serverId);
+  if (live && live.players && Array.isArray(live.players.names) && Date.now() - (live.players.at || 0) < 30000) {
+    return live.players.names;
+  }
+  return listOnlineNames(serverId);
+}
+
+async function rosterView(serverId, onlineNames = []) {
+  const key = `${serverId}|${[...onlineNames].sort().join(',')}`;
+  const cached = rosterCache.get(serverId);
+  if (cached && cached.key === key && Date.now() - cached.at < ROSTER_TTL_MS) return cached.view;
+  const view = await buildRosterView(serverId, onlineNames);
+  rosterCache.set(serverId, { at: Date.now(), key, view });
+  return view;
+}
+
+async function buildRosterView(serverId, onlineNames = []) {
+  // Six files, one read - server.properties included, so the whitelist toggle
+  // doesn't cost a second round trip to the machine holding the files.
+  const [usercache, whitelist, ops, bans, ipBans, properties] = await serverFs
+    .for(serverId)
+    .readMany([
+      'usercache.json',
+      'whitelist.json',
+      'ops.json',
+      'banned-players.json',
+      'banned-ips.json',
+      'server.properties',
+    ]);
+  const asList = (buf) => {
+    if (!buf) return [];
+    try {
+      const parsed = JSON.parse(buf.toString('utf8'));
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return []; // the server rewrites these files constantly; a torn read is not an error
+    }
+  };
+  const whitelistLine = properties && /^white-list=(.*)$/m.exec(properties.toString('utf8'));
+  return {
+    players: await listPlayers(serverId, onlineNames, [
+      asList(usercache),
+      asList(whitelist),
+      asList(ops),
+      asList(bans),
+    ]),
+    bannedIps: shapeBannedIps(asList(ipBans)),
+    whitelistEnforced: whitelistLine ? whitelistLine[1].trim() === 'true' : false,
+  };
+}
+
+function shapeBannedIps(entries) {
+  return entries
+    .filter((e) => !isBanExpired(e.expires))
+    .map((e) => ({
+      ip: e.ip,
+      reason: e.reason || null,
+      created: e.created || null,
+      source: e.source || null,
+      expires: e.expires || 'forever',
+      player: e.player || null,
+    }));
+}
+
+async function listBannedIps(serverId) {
+  return (await readJson(serverId, 'banned-ips.json'))
     .filter((e) => !isBanExpired(e.expires))
     .map((e) => ({
       ip: e.ip,
@@ -308,9 +419,9 @@ async function setWhitelisted(serverId, name, on, { running = false, actor = 'sy
   if (running) {
     await rcon(serverId, 'whitelist', on ? 'add' : 'remove', who.name);
   } else {
-    const list = readJson(serverId, 'whitelist.json').filter((e) => e.uuid !== who.uuid);
+    const list = (await readJson(serverId, 'whitelist.json')).filter((e) => e.uuid !== who.uuid);
     if (on) list.push({ uuid: who.uuid, name: who.name });
-    writeJson(serverId, 'whitelist.json', list);
+    await writeJson(serverId, 'whitelist.json', list);
   }
   recordEvent({
     serverId,
@@ -330,20 +441,15 @@ async function setWhitelistEnforced(serverId, on, { running = false, actor = 'sy
     // undoes every property the panel edited while the server was running
     // (PvP, difficulty, a Files edit). Snapshot the file first and write it
     // back with only white-list changed, so the panel's edits survive.
-    let snapshot = null;
-    try {
-      snapshot = fs.readFileSync(dataPath('servers', serverId, 'server.properties'), 'utf8');
-    } catch {
-      /* no file yet - nothing to protect */
-    }
+    const snapshot = await serverFs.for(serverId).readText('server.properties'); // null: no file yet, nothing to protect
     await rcon(serverId, 'whitelist', on ? 'on' : 'off');
-    servers.setServerProperty(serverId, 'white-list', String(on), { actor, baseText: snapshot ?? undefined });
+    await servers.setServerProperty(serverId, 'white-list', String(on), { actor, baseText: snapshot ?? undefined });
     // Also clear every env var that would re-assert whitelisting on the next start.
     servers.unsetEnvKeys(serverId, WHITELIST_PROVISIONING_ENV_KEYS, { actor });
   } else {
     // Write through the single server.properties choke point so any env that
     // would re-assert white-list on the next start is un-set too.
-    servers.setServerProperty(serverId, 'white-list', String(on), { actor });
+    await servers.setServerProperty(serverId, 'white-list', String(on), { actor });
     // setServerProperty un-sets ENABLE_WHITELIST (white-list's env), but
     // whitelisting can also be provisioned via WHITELIST/WHITELIST_FILE, which
     // the image re-asserts the same way. Clear all of them so the panel toggle
@@ -361,14 +467,11 @@ async function setWhitelistEnforced(serverId, on, { running = false, actor = 'sy
 }
 
 /** Parse server.properties for white-list= (defaults false when absent). */
-function getWhitelistEnforced(serverId) {
-  try {
-    const text = fs.readFileSync(dataPath('servers', serverId, 'server.properties'), 'utf8');
-    const m = /^white-list=(.*)$/m.exec(text);
-    return m ? m[1].trim() === 'true' : false;
-  } catch {
-    return false;
-  }
+async function getWhitelistEnforced(serverId) {
+  // Through worlds.readProps so a page that already read server.properties
+  // (the world list does) doesn't read it again - one file, one round trip.
+  const props = await require('./worlds').readProps(serverId);
+  return String(props.get('white-list') || '').trim() === 'true';
 }
 
 // ---------------------------------------------------------------------------
@@ -379,21 +482,21 @@ async function setOp(serverId, name, on, level = 4, { running = false, actor = '
   level = Math.min(4, Math.max(1, Number(level) || 4));
   let note = null;
 
-  const patchOpsFile = () => {
-    const list = readJson(serverId, 'ops.json').filter((e) => e.uuid !== who.uuid);
+  const patchOpsFile = async () => {
+    const list = (await readJson(serverId, 'ops.json')).filter((e) => e.uuid !== who.uuid);
     if (on) list.push({ uuid: who.uuid, name: who.name, level, bypassesPlayerLimit: false });
-    writeJson(serverId, 'ops.json', list);
+    await writeJson(serverId, 'ops.json', list);
   };
 
   if (running) {
     await rcon(serverId, on ? 'op' : 'deop', who.name);
     if (on && level !== 4) {
       // RCON `op` always grants level 4 - persist the requested level for next boot.
-      patchOpsFile();
+      await patchOpsFile();
       note = `RCON op grants level 4 for this session; level ${level} is saved to ops.json and takes effect after a restart.`;
     }
   } else {
-    patchOpsFile();
+    await patchOpsFile();
   }
 
   recordEvent({
@@ -419,7 +522,7 @@ async function banPlayer(serverId, name, reason, { running = false, actor = 'sys
   // RCON's own `ban` always writes 'forever' - and when stopped we must write the
   // file ourselves anyway - so (re)write the entry whenever a real expiry is set.
   if (!running || durationMs) {
-    const list = readJson(serverId, 'banned-players.json').filter((e) => e.uuid !== who.uuid);
+    const list = (await readJson(serverId, 'banned-players.json')).filter((e) => e.uuid !== who.uuid);
     list.push({
       uuid: who.uuid,
       name: who.name,
@@ -428,7 +531,7 @@ async function banPlayer(serverId, name, reason, { running = false, actor = 'sys
       expires,
       reason,
     });
-    writeJson(serverId, 'banned-players.json', list);
+    await writeJson(serverId, 'banned-players.json', list);
   }
   recordEvent({
     serverId,
@@ -445,10 +548,10 @@ async function pardonPlayer(serverId, name, { running = false, actor = 'system' 
   if (running) {
     await rcon(serverId, 'pardon', who.name);
   } else {
-    const list = readJson(serverId, 'banned-players.json').filter(
+    const list = (await readJson(serverId, 'banned-players.json')).filter(
       (e) => e.uuid !== who.uuid && (e.name || '').toLowerCase() !== who.name.toLowerCase()
     );
-    writeJson(serverId, 'banned-players.json', list);
+    await writeJson(serverId, 'banned-players.json', list);
   }
   recordEvent({
     serverId,
@@ -474,7 +577,7 @@ async function banIp(
   // Same story as banPlayer: RCON always writes 'forever' and never knows about the
   // player-linkage extension, so (re)write the entry whenever either is used.
   if (!running || durationMs || linkedPlayer) {
-    const list = readJson(serverId, 'banned-ips.json').filter((e) => e.ip !== ip);
+    const list = (await readJson(serverId, 'banned-ips.json')).filter((e) => e.ip !== ip);
     list.push({
       ip,
       created: banTimestamp(),
@@ -483,7 +586,7 @@ async function banIp(
       reason,
       player: linkedPlayer,
     });
-    writeJson(serverId, 'banned-ips.json', list);
+    await writeJson(serverId, 'banned-ips.json', list);
   }
   recordEvent({
     serverId,
@@ -500,10 +603,10 @@ async function pardonIp(serverId, ip, { running = false, actor = 'system' } = {}
   if (running) {
     await rcon(serverId, 'pardon-ip', ip);
   } else {
-    writeJson(
+    await writeJson(
       serverId,
       'banned-ips.json',
-      readJson(serverId, 'banned-ips.json').filter((e) => e.ip !== ip)
+      (await readJson(serverId, 'banned-ips.json')).filter((e) => e.ip !== ip)
     );
   }
   recordEvent({
@@ -522,12 +625,12 @@ async function pardonIp(serverId, ip, { running = false, actor = 'system' } = {}
 const ROLE_FILES = ['usercache.json', 'whitelist.json', 'ops.json', 'banned-players.json'];
 
 /** Drop every entry matching a player's uuid (lowercase-name fallback) from a role file. */
-function stripPlayerFromFile(serverId, file, who) {
+async function stripPlayerFromFile(serverId, file, who) {
   const lower = who.name.toLowerCase();
-  const remaining = readJson(serverId, file).filter(
+  const remaining = (await readJson(serverId, file)).filter(
     (e) => !(e.uuid === who.uuid) && !(e.name && e.name.toLowerCase() === lower)
   );
-  writeJson(serverId, file, remaining);
+  await writeJson(serverId, file, remaining);
 }
 
 /**
@@ -581,25 +684,26 @@ async function deletePlayer(serverId, name, { running = false, actor = 'system' 
 
   // Role files (also rewritten on disk so a stopped server, or one that does
   // not rewrite them itself, forgets the player too).
-  for (const file of ROLE_FILES) stripPlayerFromFile(serverId, file, who);
+  for (const file of ROLE_FILES) await stripPlayerFromFile(serverId, file, who);
 
   // World-scoped data. Resolve the active level exactly like inventory.js so we
   // never guess a path (level-name / LEVEL env both honored).
   let removed = { playerdata: 0, stats: false, advancements: false, snapshots: false, notes: 0 };
   try {
     const server = require('./servers').getServer(serverId);
-    const level = require('./worlds').activeLevelName(server);
-    // Every path goes through the guard (never a bare path.join on a uuid that
-    // came from a file the Minecraft process wrote).
-    const inWorld = (...segs) => dataPath('servers', serverId, level, ...segs);
+    const level = await require('./worlds').activeLevelName(server);
+    // Every path goes through serverFs (never a bare join on a uuid that came
+    // from a file the Minecraft process wrote).
+    const handle = serverFs.for(serverId);
+    const inWorld = (...segs) => [level, ...segs].join('/');
 
     // Playerdata - delete both the modern and legacy .dat (+ .dat_old backups),
     // tolerating either layout or none at all (never-joined players have none).
-    for (const dir of [['players', 'data'], ['playerdata']]) {
+    for (const dir of ['players/data', 'playerdata']) {
       for (const ext of ['.dat', '.dat_old']) {
-        const file = inWorld(...dir, `${who.uuid}${ext}`);
-        if (!fs.existsSync(file)) continue;
-        fs.rmSync(file, { force: true });
+        const file = inWorld(dir, `${who.uuid}${ext}`);
+        if (!(await handle.exists(file))) continue;
+        await handle.remove(file);
         removed.playerdata += 1;
       }
     }
@@ -608,8 +712,8 @@ async function deletePlayer(serverId, name, { running = false, actor = 'system' 
     // actually there rather than "true" for a file that never existed.
     for (const kind of ['stats', 'advancements']) {
       const file = inWorld(kind, `${who.uuid}.json`);
-      if (!fs.existsSync(file)) continue;
-      fs.rmSync(file, { force: true });
+      if (!(await handle.exists(file))) continue;
+      await handle.remove(file);
       removed[kind] = true;
     }
   } catch {
@@ -654,8 +758,8 @@ async function sweepExpiredBans() {
     // time, and this runs every 15 minutes for every server. Only pay for a
     // Docker inspect call (a real API round-trip) when there's actually
     // something expired to pardon.
-    const expiredPlayers = readJson(server.id, 'banned-players.json').filter((e) => isBanExpired(e.expires));
-    const expiredIps = readJson(server.id, 'banned-ips.json').filter((e) => isBanExpired(e.expires));
+    const expiredPlayers = (await readJson(server.id, 'banned-players.json')).filter((e) => isBanExpired(e.expires));
+    const expiredIps = (await readJson(server.id, 'banned-ips.json')).filter((e) => isBanExpired(e.expires));
     if (!expiredPlayers.length && !expiredIps.length) continue;
 
     let running = false;
@@ -832,7 +936,7 @@ async function getPlayerPosition(serverId, player) {
  * fine for a search centre. Returns null when there's no saved data.
  */
 async function getPlayerSavedPos(serverId, player) {
-  const id = localIdentity(serverId, player);
+  const id = await localIdentity(serverId, player);
   if (!id || !id.uuid) return null;
   try {
     const data = await require('./inventory').readPlayerData(serverId, id.uuid);
@@ -1341,6 +1445,9 @@ module.exports = {
   writeJson,
   listPlayers,
   listBannedIps,
+  rosterView,
+  onlineNames,
+  forgetRoster,
   listOnlineNames,
   setWhitelisted,
   setWhitelistEnforced,

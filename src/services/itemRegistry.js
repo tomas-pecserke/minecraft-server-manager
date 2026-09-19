@@ -26,11 +26,9 @@
 // the JSON blob on every request.
 
 const httpError = require('../utils/httpError');
-const fsp = require('node:fs/promises');
-const path = require('node:path');
 const yauzl = require('yauzl');
 const db = require('../db');
-const { dataPath } = require('../storage/pathGuard');
+const serverFs = require('../storage/serverFs');
 
 const CACHE_PREFIX = 'item-registry:';
 const LANG_RE = /^assets\/([a-z0-9_.-]+)\/lang\/en_us\.json$/i;
@@ -219,52 +217,28 @@ function parseLang(buf) {
 // ---------------------------------------------------------------------------
 // vanilla server jar discovery
 
-/** Candidate vanilla jar paths for a server, best-first. */
+/** Candidate vanilla jar paths for a server, best-first (server-relative). */
 async function vanillaJarCandidates(serverId) {
-  const base = dataPath('servers', serverId);
-  const candidates = [];
+  const handle = serverFs.for(serverId);
+  const sized = [];
 
   // Top-level jars (vanilla / custom: server.jar, minecraft_server*.jar, …)
-  try {
-    for (const e of await fsp.readdir(base, { withFileTypes: true })) {
-      if (e.isFile() && e.name.toLowerCase().endsWith('.jar')) candidates.push(path.join(base, e.name));
-    }
-  } catch {
-    /* server dir gone */
+  for (const e of await handle.readdir('').catch(() => [])) {
+    if (!e.dir && e.name.toLowerCase().endsWith('.jar')) sized.push({ rel: e.name, size: e.size });
   }
 
-  // Forge/NeoForge: libraries/net/minecraft/server/<version>/*.jar
-  const libDir = path.join(base, 'libraries', 'net', 'minecraft', 'server');
-  const walk = async (dir, depth) => {
-    if (depth > 3) return;
-    let entries;
-    try {
-      entries = await fsp.readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      const abs = path.join(dir, e.name);
-      if (e.isDirectory()) await walk(abs, depth + 1);
-      else if (e.isFile() && e.name.endsWith('.jar')) candidates.push(abs);
-    }
-  };
-  await walk(libDir, 0);
-
-  // Paper-family keeps the Mojang jar under cache/.
-  await walk(path.join(base, 'cache'), 0);
-
-  // Largest first - the full server jar dwarfs slim/extra variants.
-  const sized = [];
-  for (const abs of candidates) {
-    try {
-      sized.push({ abs, size: (await fsp.stat(abs)).size });
-    } catch {
-      /* raced */
+  // Forge/NeoForge keeps it under libraries/net/minecraft/server/<version>/,
+  // Paper-family under cache/ - one bounded walk each.
+  for (const [dir, depth] of [
+    ['libraries/net/minecraft/server', 4],
+    ['cache', 4],
+  ]) {
+    for (const e of await handle.walk(dir, { maxDepth: depth }).catch(() => [])) {
+      if (!e.dir && e.name.endsWith('.jar')) sized.push({ rel: `${dir}/${e.path}`, size: e.size });
     }
   }
   sized.sort((a, b) => b.size - a.size);
-  return sized.map((c) => c.abs);
+  return sized.map((c) => c.rel);
 }
 
 /**
@@ -273,26 +247,33 @@ async function vanillaJarCandidates(serverId) {
  * @returns {{entries:[], jarPath:string}|null}
  */
 async function readVanillaLang(serverId) {
+  const handle = serverFs.for(serverId);
   for (const jarPath of await vanillaJarCandidates(serverId)) {
     try {
-      const found = await pickZipEntries(
-        jarPath,
-        (n) => LANG_RE.test(n) || NESTED_SERVER_RE.test(n),
-        (f) => [...f.keys()].some((n) => LANG_RE.test(n))
-      );
-      const direct = [...found.entries()].find(([n]) => LANG_RE.test(n));
-      if (direct) return { entries: parseLang(direct[1]), jarPath };
-
-      const nested = [...found.entries()].find(([n]) => NESTED_SERVER_RE.test(n));
-      if (nested) {
-        const inner = await pickZipEntries(
-          nested[1],
-          (n) => LANG_RE.test(n),
-          (f) => f.size > 0
+      // The zip reader needs a real file; a remote server gets a temp copy of
+      // the one candidate jar, dropped again as soon as it has been read.
+      const result = await handle.withLocalCopy(jarPath, async (abs) => {
+        const found = await pickZipEntries(
+          abs,
+          (n) => LANG_RE.test(n) || NESTED_SERVER_RE.test(n),
+          (f) => [...f.keys()].some((n) => LANG_RE.test(n))
         );
-        const lang = [...inner.values()][0];
-        if (lang) return { entries: parseLang(lang), jarPath };
-      }
+        const direct = [...found.entries()].find(([n]) => LANG_RE.test(n));
+        if (direct) return { entries: parseLang(direct[1]), jarPath };
+
+        const nested = [...found.entries()].find(([n]) => NESTED_SERVER_RE.test(n));
+        if (nested) {
+          const inner = await pickZipEntries(
+            nested[1],
+            (n) => LANG_RE.test(n),
+            (f) => f.size > 0
+          );
+          const lang = [...inner.values()][0];
+          if (lang) return { entries: parseLang(lang), jarPath };
+        }
+        return null;
+      });
+      if (result) return result;
     } catch {
       /* not a readable zip / no assets - try the next candidate */
     }
@@ -412,24 +393,18 @@ function iconBaseUrl() {
 // fingerprint - cheap change detection over the inputs
 
 async function computeFingerprint(serverId) {
-  const modsDir = dataPath('servers', serverId, 'mods');
   let count = 0;
   let totalSize = 0;
   let maxMtime = 0;
-  try {
-    for (const e of await fsp.readdir(modsDir, { withFileTypes: true })) {
-      if (!e.isFile() || !e.name.toLowerCase().endsWith('.jar')) continue;
-      try {
-        const st = await fsp.stat(path.join(modsDir, e.name));
-        count += 1;
-        totalSize += st.size;
-        if (st.mtimeMs > maxMtime) maxMtime = st.mtimeMs;
-      } catch {
-        /* raced deletion */
-      }
-    }
-  } catch {
-    /* no mods dir - vanilla server */
+  // No mods dir - a vanilla server - simply contributes nothing here.
+  for (const e of await serverFs
+    .for(serverId)
+    .readdir('mods')
+    .catch(() => [])) {
+    if (e.dir || !e.name.toLowerCase().endsWith('.jar')) continue;
+    count += 1;
+    totalSize += e.size;
+    if (e.mtimeMs > maxMtime) maxMtime = e.mtimeMs;
   }
 
   // Vanilla jar identity: the best candidate's path + size (mtime shifts on
@@ -437,12 +412,8 @@ async function computeFingerprint(serverId) {
   let vanilla = 'none';
   const cands = await vanillaJarCandidates(serverId);
   if (cands.length) {
-    try {
-      const st = await fsp.stat(cands[0]);
-      vanilla = `${path.relative(dataPath('servers', serverId), cands[0])}:${st.size}`;
-    } catch {
-      /* raced */
-    }
+    const st = await serverFs.for(serverId).statOrNull(cands[0]);
+    if (st) vanilla = `${cands[0]}:${st.size}`;
   }
   // A server with no on-disk vanilla jar yet (never started) has no jar
   // identity to key off - mc_version explicitly, so switching it pre-launch
@@ -488,22 +459,22 @@ async function buildRegistry(serverId, { onProgress = () => {} } = {}) {
     }
   }
 
-  const modsDir = dataPath('servers', serverId, 'mods');
-  let jars = [];
-  try {
-    jars = (await fsp.readdir(modsDir, { withFileTypes: true }))
-      .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.jar'))
-      .map((e) => e.name)
-      .sort();
-  } catch {
-    /* vanilla server - no mods dir */
-  }
+  const handle = serverFs.for(serverId);
+  // No mods dir at all is the vanilla case - an empty list, not an error.
+  const jars = (await handle.readdir('mods').catch(() => []))
+    .filter((e) => !e.dir && e.name.toLowerCase().endsWith('.jar'))
+    .map((e) => e.name)
+    .sort();
 
   let done = 0;
   const scanJar = async (name) => {
     let found;
     try {
-      found = await pickZipEntries(path.join(modsDir, name), (n) => LANG_RE.test(n) || META_RE.test(n));
+      // pickZipEntries needs a real file; on a remote server that is a temp copy
+      // of this one jar, which withLocalCopy removes as soon as it is scanned.
+      found = await handle.withLocalCopy(`mods/${name}`, (abs) =>
+        pickZipEntries(abs, (n) => LANG_RE.test(n) || META_RE.test(n))
+      );
     } catch {
       return; // corrupt/unreadable jar - never fatal
     } finally {
@@ -572,7 +543,7 @@ async function buildRegistry(serverId, { onProgress = () => {} } = {}) {
     builtAt: Date.now(),
     buildMs: Date.now() - started,
     fingerprint,
-    vanillaJar: vanilla ? path.relative(dataPath('servers', serverId), vanilla.jarPath).replace(/\\/g, '/') : null,
+    vanillaJar: vanilla ? vanilla.jarPath : null,
     jarCount: jars.length,
   };
 

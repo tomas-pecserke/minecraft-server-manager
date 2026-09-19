@@ -74,3 +74,17 @@ test('computeFingerprint counts mod jars and reflects mc_version', async () => {
   // v2|count|totalSize|mtime|vanilla|mc_version
   assert.match(fp, /^v2\|2\|300\|/);
 });
+
+test('computeFingerprint identifies the server jar, so a swapped jar invalidates the registry', async () => {
+  const sid = app.seedServer('iregjar');
+  fs.mkdirSync(dataPath('servers', sid), { recursive: true });
+  fs.writeFileSync(dataPath('servers', sid, 'server.jar'), Buffer.alloc(4096));
+
+  const fp = await reg.computeFingerprint(sid);
+  // The jar's name and size are what tell a rebuilt registry from a stale one;
+  // a candidate list that lost its paths would leave "undefined" here instead.
+  assert.match(fp, /\|server\.jar:4096\|/, fp);
+
+  fs.writeFileSync(dataPath('servers', sid, 'server.jar'), Buffer.alloc(8192));
+  assert.notEqual(await reg.computeFingerprint(sid), fp, 'a different jar is a different fingerprint');
+});

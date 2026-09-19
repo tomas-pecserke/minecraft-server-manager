@@ -231,6 +231,45 @@ function resolveDataDirHost() {
 }
 
 /**
+ * Where a server's /data lives: 'bind' mounts DATA_DIR/servers/<id> straight
+ * off the panel's own filesystem, 'volume' puts it in a Docker named volume on
+ * whatever host the daemon runs on and the panel reaches it over the Docker
+ * API. A bind mount only works when the daemon shares a filesystem with the
+ * panel, so a remote daemon (DOCKER_HOST=tcp:// or ssh://) defaults to
+ * 'volume'; everything else defaults to 'bind' and behaves exactly as before.
+ */
+function resolveServerStorage() {
+  const raw = (process.env.SERVER_STORAGE || '').trim().toLowerCase();
+  if (raw === 'bind' || raw === 'volume') return raw;
+  if (raw) {
+    throw new Error(`SERVER_STORAGE must be "bind" or "volume" - got "${process.env.SERVER_STORAGE}".`);
+  }
+  return isRemoteDockerHost() ? 'volume' : 'bind';
+}
+
+/** True when DOCKER_HOST points at a daemon on another machine. */
+function isRemoteDockerHost() {
+  const raw = (process.env.DOCKER_HOST || '').trim().toLowerCase();
+  return (
+    raw.startsWith('tcp://') || raw.startsWith('ssh://') || raw.startsWith('http://') || raw.startsWith('https://')
+  );
+}
+
+/**
+ * The machine a remote daemon runs on, taken from DOCKER_HOST; null for a local
+ * daemon. That host is where containers publish their ports, so it is both the
+ * address players connect to and the one the map proxy has to reach.
+ */
+function resolveDockerHostname() {
+  if (!isRemoteDockerHost()) return null;
+  try {
+    return new URL(process.env.DOCKER_HOST.trim()).hostname || null;
+  } catch {
+    return null; // unparseable DOCKER_HOST - everything falls back to this machine
+  }
+}
+
+/**
  * Address the panel uses to reach OTHER containers' host-published ports (e.g.
  * BlueMap's map webserver) - used by the /map proxy. Bare metal, the panel's
  * own '127.0.0.1' IS the host's, so no translation is needed. Containerized
@@ -245,6 +284,10 @@ function resolveDataDirHost() {
 function resolveMapProxyHost() {
   const raw = (process.env.MAP_PROXY_HOST || '').trim();
   if (raw) return raw;
+  // A remote daemon publishes container ports on ITS host, not the panel's, so
+  // neither loopback nor host.docker.internal reaches them - the daemon's own
+  // hostname does.
+  if (resolveDockerHostname()) return resolveDockerHostname();
   return resolveDataDirHost() === dataDir ? '127.0.0.1' : 'host.docker.internal';
 }
 
@@ -278,6 +321,27 @@ const config = {
   logLevel: resolveLogLevel(),
   sentry: resolveSentry(),
   mapProxyHost: resolveMapProxyHost(),
+
+  // 'bind' (daemon shares the panel's filesystem) or 'volume' (server data
+  // lives in a Docker named volume, reached over the Docker API).
+  serverStorage: resolveServerStorage(),
+  // True when the daemon runs on another machine, so anything about "this
+  // host" (free ports, local paths) says nothing about where containers land.
+  dockerRemote: isRemoteDockerHost(),
+  // Hostname of a remote daemon's machine (null when Docker is local): where
+  // containers publish their ports, so where players connect.
+  dockerHostname: resolveDockerHostname(),
+
+  // Image the file-access sidecar runs. Blank (the default) means "the server's
+  // own image" - it is already pulled on that host and carries GNU coreutils
+  // and findutils, which the directory listings rely on. Override only to save
+  // the memory a second copy of a large image costs, with something that has a
+  // shell plus GNU find/stat/du.
+  sidecarImage: (process.env.SIDECAR_IMAGE || '').trim(),
+  // Stop an idle sidecar after this long. It costs a few MB of RAM while up
+  // and nothing once stopped, so the window is generous: an operator working
+  // through a server's files shouldn't keep paying to start it again.
+  sidecarIdleMs: numFromEnv('SIDECAR_IDLE_SECONDS', 900, { min: 10, max: 86400 }) * 1000,
 
   // Docker image repository for Minecraft servers. Override for a private mirror
   // or air-gapped registry; the panel is otherwise an itzg/minecraft-server front-end.

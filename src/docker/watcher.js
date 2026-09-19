@@ -87,8 +87,15 @@ function retryLater() {
 }
 
 async function handleEvent(evt) {
-  const serverId = evt.Actor && evt.Actor.Attributes && evt.Actor.Attributes[LABEL];
+  const attrs = (evt.Actor && evt.Actor.Attributes) || {};
+  const serverId = attrs[LABEL];
   if (!serverId) return;
+  // Helper containers (the file sidecar, cleanup, chown) carry the same msm.id
+  // as the server they belong to. Their start/die/health events say nothing
+  // about the Minecraft server and must never move its status - a sidecar
+  // starting would read as the server starting, and stopping it after its idle
+  // spell as the server stopping.
+  if (attrs['msm.role']) return;
   const server = db.get('SELECT * FROM servers WHERE id = ?', serverId);
   if (!server) return;
 

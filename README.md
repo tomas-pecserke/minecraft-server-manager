@@ -168,6 +168,54 @@ pm2 save
 
 (or `pm2 kill && pm2 resurrect` to relaunch the whole daemon under your current default Node.)
 
+### 🌐 Option 4: Panel here, Docker somewhere else
+
+The panel does not have to run on the machine hosting the servers. Point it at the remote daemon
+and it keeps each server's files in a Docker **volume** on that machine, reaching them over the
+Docker API instead of through a shared filesystem:
+
+```bash
+DOCKER_HOST=tcp://10.0.0.5:2375   # the daemon to drive; include the port
+# SERVER_STORAGE=volume is the default for a remote DOCKER_HOST; set it explicitly to be sure.
+```
+
+What that changes:
+
+- **Server files** (world, mods, config) live in a volume named `msm-<serverId>` on the Docker
+  host. The file manager, mod installs, world tools and crash reports all work; they move bytes
+  over the Docker API rather than reading a local disk.
+- **Backups** are still written on the panel's machine, streamed out of the volume - so they
+  survive the Docker host and need free space here, not there.
+- Each server gets a small **file sidecar** container (`msm-fs-<serverId>`) while the panel is
+  working with its files; it stops itself after a few idle minutes.
+- `MAP_PROXY_HOST` defaults to the host in `DOCKER_HOST`, since published ports are on that
+  machine. Override it if the daemon answers on a different address than the game ports.
+- **Ports** are allocated against the daemon's host: the panel unions its own records with the
+  ports containers already publish there. A port held by something that is not a container on that
+  machine is still only caught when the container fails to start, with a clear message.
+- Secure the daemon endpoint: plain `tcp://` is unauthenticated root access to that machine. Use
+  TLS (`DOCKER_TLS_VERIFY` + `DOCKER_CERT_PATH`), or keep the daemon on a private network you
+  trust. If you want SSH, forward the daemon's port yourself and point `DOCKER_HOST` at the local
+  end of the tunnel; `ssh://` in `DOCKER_HOST` is handled by the Docker client library alone and
+  is not a setup the panel supports.
+- Give `DOCKER_HOST` an explicit port. A port-less `tcp://host` is not the same thing here as it
+  is for the `docker` CLI: the request goes to port 80, where a web server may answer instead of
+  the daemon.
+
+**What volume storage costs.** Without a shared filesystem there is no path to read, so every look
+at a server's files is a command run inside that server's file sidecar. Measured against a daemon
+on the same LAN, one such command costs about 80ms whether it asks for one byte or lists a whole
+modpack - create the exec, start it, spawn the process - so what a page costs is the number of
+commands it needs, not the work in them. A tab that only reads the database renders in about 45ms;
+the worlds tab, which lists the world folders, checks each for a `level.dat` and measures them,
+renders in about 130ms.
+
+That is the price of `volume` storage, not of a remote daemon as such, and the panel is built
+around it: `serverFs` batches (one command for a listing plus its sizes plus its probes, one for a
+set of files), pages that only print sizes read them from the storage index instead of measuring,
+and the world listing is cached for a few seconds. Keep that in mind when adding a page - a loop
+that reads five files one at a time is five round trips here and free on a bind mount.
+
 ### 🪟 Windows notes
 
 - Docker Desktop must be running before you start/create servers.
@@ -431,6 +479,8 @@ Exposing the raw panel port on the internet means logins travel over **plain HTT
 | `RATE_LIMIT_API_PER_MIN` / `RATE_LIMIT_AUTH_PER_15MIN` / `RATE_LIMIT_PUBLIC_API_PER_MIN` | `1200` / `100` / `120`     | Per-client-IP request ceilings: all of `/api`, login / 2FA / setup POSTs, and per-token requests to the public `/api/v1`. `0` disables that limiter. A volume backstop on top of the per-account login lockout.                                                                                                                                                                                                                                                                                                                     |
 | `MSM_EXIT_ON_FATAL`                                                                      | -                          | `1`/`true`/`yes` makes the post-boot runtime guard hard-exit on an uncaught exception/rejection instead of logging and staying up - for supervised deployments (`systemd`, Docker `restart:`).                                                                                                                                                                                                                                                                                                                                      |
 | `DOCKER_HOST`                                                                            | auto-detected              | Docker endpoint override for rootless Docker, Podman, or a remote daemon (per-OS socket/pipe otherwise).                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `SERVER_STORAGE`                                                                         | see note                   | Where each server's `/data` lives: `bind` (a directory under `DATA_DIR`, bind-mounted - needs a daemon that shares this filesystem) or `volume` (a Docker named volume on the daemon's host, reached over the Docker API - which is what makes a **remote** daemon work). Defaults to `volume` for a remote `DOCKER_HOST`, `bind` otherwise. Backups always land on the panel's own disk.                                                                                                                                           |
+| `SIDECAR_IMAGE` / `SIDECAR_IDLE_SECONDS`                                                 | server's image / `900`     | Volume storage only: the image the per-server file sidecar runs (blank = the server's own image, already present on that host) and how long an idle sidecar stays up.                                                                                                                                                                                                                                                                                                                                                               |
 | `CF_API_KEY`                                                                             | -                          | Optional [CurseForge API key](https://console.curseforge.com/) to seed on first run (also settable in the UI). Wrap in single quotes; CF keys often contain `$`.                                                                                                                                                                                                                                                                                                                                                                    |
 | `GITHUB_TOKEN`                                                                           | -                          | Optional GitHub token to raise the unauthenticated API quota for the GitHub Releases content source (ETag caching keeps usage minimal either way).                                                                                                                                                                                                                                                                                                                                                                                  |
 | `MC_IMAGE_REPO`                                                                          | `itzg/minecraft-server`    | Docker image repo for servers; override for a private mirror / air-gapped registry.                                                                                                                                                                                                                                                                                                                                                                                                                                                 |

@@ -17,7 +17,8 @@ const { extractZip, readZipIndex } = require('../utils/zip');
 const { nanoid } = require('nanoid');
 const { z } = require('zod');
 const db = require('../db');
-const { dataPath, safeJoin } = require('../storage/pathGuard');
+const { dataPath } = require('../storage/pathGuard');
+const serverFs = require('../storage/serverFs');
 
 // Starter blueprints inherit the panel's host-aware resource defaults so they
 // import cleanly on a small VPS as well as a big workstation.
@@ -143,7 +144,7 @@ async function exportBlueprint(serverId, options = {}, { actor = 'system' } = {}
   const includeConfig = options.includeConfig !== false;
   const embedFiles = Boolean(options.embedFiles);
   const includeWorld = Boolean(options.includeWorld);
-  const serverDir = dataPath('servers', serverId);
+  const handle = serverFs.for(serverId);
 
   const pack = packs.getPack(serverId);
   const overlayRows = db.all(
@@ -154,11 +155,11 @@ async function exportBlueprint(serverId, options = {}, { actor = 'system' } = {}
     serverId
   );
 
-  const configFiles = includeConfig ? collectConfigFiles(serverDir) : [];
-  const worldDirs = includeWorld ? worldDirsOf(server, serverDir) : [];
+  const configFiles = includeConfig ? await collectConfigFiles(handle) : [];
+  const worldDirs = includeWorld ? await worldDirsOf(server, handle) : [];
   if (includeWorld && worldDirs.length) {
     let needed = 0;
-    for (const d of worldDirs) needed += await servers.dirSize(d.abs);
+    for (const d of worldDirs) needed += (await handle.du(d.name)).size;
     const { free } = await indexer.diskFree();
     if (free < needed * 1.1) {
       throw httpError(507, `Not enough disk space to embed the world (~${(needed / 1024 ** 3).toFixed(1)} GB needed)`);
@@ -223,26 +224,38 @@ async function exportBlueprint(serverId, options = {}, { actor = 'system' } = {}
   const absPath = dataPath(relPath);
   await fsp.mkdir(path.dirname(absPath), { recursive: true });
 
-  await new Promise((resolve, reject) => {
-    const output = fs.createWriteStream(absPath);
-    const archive = archiver('zip', { zlib: { level: 6 } });
+  // The server's own files are streamed out of wherever they live (this disk,
+  // or the Docker host) rather than added by path; the library files beside
+  // them are always panel-local.
+  const output = fs.createWriteStream(absPath);
+  const archive = archiver('zip', { zlib: { level: 6 } });
+  const written = new Promise((resolve, reject) => {
     output.on('close', resolve);
+    output.on('error', reject);
     archive.on('error', reject);
-    archive.pipe(output);
-    archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
-    for (const rel of configFiles) {
-      archive.file(safeJoin(serverDir, rel), { name: `payload/config/${rel}` });
-    }
-    if (embedFiles) {
-      for (const row of overlayRows) {
-        if (row.lib_rel_path && fs.existsSync(dataPath(row.lib_rel_path))) {
-          archive.file(dataPath(row.lib_rel_path), { name: `payload/overlay/${row.filename}` });
-        }
+  });
+  archive.pipe(output);
+  archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
+  for (const rel of configFiles) {
+    archive.append(await handle.readStream(rel), { name: `payload/config/${rel}` });
+  }
+  if (embedFiles) {
+    for (const row of overlayRows) {
+      if (row.lib_rel_path && fs.existsSync(dataPath(row.lib_rel_path))) {
+        archive.file(dataPath(row.lib_rel_path), { name: `payload/overlay/${row.filename}` });
       }
     }
-    for (const dir of worldDirs) archive.directory(dir.abs, `payload/world/${dir.name}`);
-    archive.finalize();
-  });
+  }
+  for (const dir of worldDirs) {
+    for (const entry of await handle.walk(dir.name)) {
+      if (entry.dir || entry.symlink) continue;
+      archive.append(await handle.readStream(`${dir.name}/${entry.path}`), {
+        name: `payload/world/${dir.name}/${entry.path}`,
+      });
+    }
+  }
+  archive.finalize();
+  await written;
 
   const size = (await fsp.stat(absPath)).size;
   const id = `bp_${nanoid(8)}`;
@@ -426,19 +439,22 @@ async function importBlueprint(zipRef, overrides = {}, { actor = 'system', onPro
     }
 
     // Config files payload → server dir (paths re-guarded against the server dir).
+    const handle = serverFs.for(server.id);
     for (const rel of manifest.configFiles) {
       const src = path.join(tmpDir, 'payload', 'config', rel);
       if (!fs.existsSync(src)) continue;
-      const dest = safeJoin(dataPath('servers', server.id), rel);
-      await fsp.mkdir(path.dirname(dest), { recursive: true });
-      await fsp.copyFile(src, dest);
+      // serverFs re-guards the path against the server's own directory.
+      await handle.uploadFile(src, rel);
     }
 
     // World payload → server dir (dir names come from the extracted tree).
     const worldPayload = path.join(tmpDir, 'payload', 'world');
     if (manifest.world && fs.existsSync(worldPayload)) {
       onProgress('Installing world…');
-      await fsp.cp(worldPayload, dataPath('servers', server.id), { recursive: true, force: true });
+      for (const entry of await fsp.readdir(worldPayload, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        await handle.uploadDir(path.join(worldPayload, entry.name), entry.name);
+      }
     }
   } finally {
     await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
@@ -505,7 +521,7 @@ async function installOverlayItem(entry, server, tmpDir, { actor }) {
 
 /** Turn an overlay manifest entry into a direct download URL + library meta. */
 async function resolveOverlaySource(entry, server) {
-  const loader = mods.loaderOf(server);
+  const loader = await mods.loaderOf(server);
   const mcVersion = ['LATEST', 'SNAPSHOT'].includes(server.mc_version) ? undefined : server.mc_version;
 
   // Exact pinned file when the platform ids are recorded.
@@ -806,34 +822,23 @@ function sanitizeEnv(env) {
   return Object.fromEntries(Object.entries(env || {}).filter(([k]) => !SECRET_ENV_RE.test(k)));
 }
 
-function collectConfigFiles(serverDir) {
+async function collectConfigFiles(handle) {
   const rels = [];
-  if (fs.existsSync(path.join(serverDir, 'server.properties'))) rels.push('server.properties');
-  const walk = (abs, rel) => {
-    let entries;
-    try {
-      entries = fs.readdirSync(abs, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      const childRel = `${rel}/${entry.name}`;
-      if (entry.isDirectory()) walk(path.join(abs, entry.name), childRel);
-      else if (entry.isFile()) rels.push(childRel);
-    }
-  };
-  if (fs.existsSync(path.join(serverDir, 'config'))) walk(path.join(serverDir, 'config'), 'config');
+  if (await handle.exists('server.properties')) rels.push('server.properties');
+  for (const entry of await handle.walk('config').catch(() => [])) {
+    if (!entry.dir && !entry.symlink) rels.push(`config/${entry.path}`);
+  }
   return rels;
 }
 
 /** World dirs to embed: the active level dir plus its Bukkit-style split siblings. */
-function worldDirsOf(server, serverDir) {
+async function worldDirsOf(server, handle) {
   // activeLevelName honors LEVEL env AND server.properties level-name - a
   // renamed/activated world would otherwise be silently missing from exports.
-  const level = require('../services/worlds').activeLevelName(server);
-  return [level, `${level}_nether`, `${level}_the_end`]
-    .map((name) => ({ name, abs: path.join(serverDir, name) }))
-    .filter((d) => fs.existsSync(d.abs) && fs.statSync(d.abs).isDirectory());
+  const level = await require('../services/worlds').activeLevelName(server);
+  const names = [level, `${level}_nether`, `${level}_the_end`];
+  const stats = await handle.statMany(names);
+  return names.filter((_, i) => stats[i] && stats[i].dir).map((name) => ({ name }));
 }
 
 function hashFile(absFile) {

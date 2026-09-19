@@ -12,7 +12,6 @@
 
 const httpError = require('../utils/httpError');
 const fs = require('node:fs');
-const os = require('node:os');
 const archiver = require('archiver');
 const db = require('../db');
 const { dataPath } = require('../storage/pathGuard');
@@ -29,20 +28,9 @@ function mustGet(serverId) {
   return server;
 }
 
-/** Non-internal local IPv4 addresses, LAN-looking ones first. */
-function localIPv4s() {
-  const ips = [];
-  for (const ifaces of Object.values(os.networkInterfaces())) {
-    for (const iface of ifaces || []) {
-      if (iface.family === 'IPv4' && !iface.internal) ips.push(iface.address);
-    }
-  }
-  return ips.sort((a, b) => Number(isLan(b)) - Number(isLan(a)));
-}
-
-function isLan(ip) {
-  return /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip);
-}
+// Which machine actually publishes the game port - this one, or a remote
+// Docker host - is decided in one place for every address the panel shows.
+const { connectCandidates, wanIpDescribesServer } = require('../services/connectAddress');
 
 // ---------------------------------------------------------------------------
 // Public IP detection (replaces UPnP - no new dependencies).
@@ -62,10 +50,14 @@ async function detectPublicIp() {
 }
 
 function portForwardGuidance(port) {
+  // The port is open on whichever machine runs the container, which is not this
+  // one when Docker is remote - forwarding to the panel would reach nothing.
+  const daemon = require('../services/connectAddress').daemonHost();
+  const target = daemon ? `the Docker host (${daemon})` : 'this machine';
   return [
-    `To let friends outside your network join, forward TCP port ${port} on your router to this machine.`,
+    `To let friends outside your network join, forward TCP port ${port} on your router to ${target}.`,
     'Open your router admin page (usually 192.168.1.1 or 192.168.0.1), find "Port Forwarding" (sometimes under NAT or Virtual Server),',
-    `and add a rule: external port ${port} → this computer's LAN IP, port ${port}, protocol TCP.`,
+    `and add a rule: external port ${port} → ${daemon ? `${daemon}` : "this computer's LAN IP"}, port ${port}, protocol TCP.`,
     'Then share your public IP with the port. If your ISP uses CGNAT, port forwarding will not work, so consider a tunnel (for example, playit.gg) instead.',
   ].join(' ');
 }
@@ -76,18 +68,21 @@ function portForwardGuidance(port) {
 async function inviteInfo(serverId) {
   const server = mustGet(serverId);
   const port = server.port_game;
-  const candidates = localIPv4s().map((ip) => `${ip}:${port}`);
+  // No loopback here: the reader of an invite is on another machine.
+  const candidates = connectCandidates(port, { loopback: false });
 
   const mcVersion = await displayVersion(server.mc_version);
   const flavor = flavorLabel(server.type);
-  const whitelistEnforced = players.getWhitelistEnforced(serverId);
+  const whitelistEnforced = await players.getWhitelistEnforced(serverId);
 
   const content = await modsService.listContent(serverId).catch(() => []);
   const activeMods = content.filter((m) => m.enabled && !m.missing && (m.kind === 'mod' || m.kind === 'plugin'));
   const { manual } = splitOverlay(serverId);
-  const publicIp = await detectPublicIp();
+  // A WAN address detected from THIS machine only describes the server when
+  // the container runs here or on the same private network - see connectAddress.
+  const publicIp = wanIpDescribesServer() ? await detectPublicIp() : null;
 
-  const address = candidates[0] || `<this machine's IP>:${port}`;
+  const address = candidates[0] || `<the server's IP>:${port}`;
   const lines = [
     `You're invited to "${server.display_name}"!`,
     `Address: ${address}`,
@@ -207,7 +202,7 @@ async function generateMrpack(serverId, { host } = {}) {
     files,
   };
 
-  const address = host || `${localIPv4s()[0] || 'localhost'}:${server.port_game}`;
+  const address = host || connectCandidates(server.port_game)[0] || `localhost:${server.port_game}`;
   const serversDat = buildServersDat({ name: server.display_name, ip: address });
 
   fs.mkdirSync(dataPath('tmp'), { recursive: true });

@@ -25,6 +25,7 @@ const gzipAsync = promisify(zlib.gzip);
 const nbt = require('prismarine-nbt');
 const db = require('../db');
 const { dataPath } = require('../storage/pathGuard');
+const serverFs = require('../storage/serverFs');
 const { recordEvent } = require('../events');
 const { execCapture, inspectStatus } = require('../docker/containers');
 const logger = require('../logger')(path.basename(__filename));
@@ -58,22 +59,18 @@ const OFFHAND_SLOT = -106;
 // Playerdata read - resolve the active world's playerdata directory, parse the
 // .dat NBT, and shape it into the panel's inventory view.
 
-function playerdataDir(serverId) {
+/** The active world's playerdata directory, relative to the server's data dir. */
+async function playerdataDir(serverId) {
   const server = require('./servers').getServer(serverId);
   if (!server) throw httpError(404, 'Server not found');
-  const level = require('./worlds').activeLevelName(server);
-  const modern = dataPath('servers', serverId, level, 'players', 'data');
-  const legacy = dataPath('servers', serverId, level, 'playerdata');
-  const has = (dir) => {
-    try {
-      return fs.readdirSync(dir).some((f) => f.endsWith('.dat'));
-    } catch {
-      return false;
-    }
-  };
-  if (has(modern)) return modern;
-  if (has(legacy)) return legacy;
-  return fs.existsSync(modern) ? modern : legacy;
+  const handle = serverFs.for(serverId);
+  const level = await require('./worlds').activeLevelName(server);
+  const modern = `${level}/players/data`; // MC 26.x layout
+  const legacy = `${level}/playerdata`;
+  const has = async (dir) => (await handle.readdir(dir).catch(() => [])).some((e) => e.name.endsWith('.dat'));
+  if (await has(modern)) return modern;
+  if (await has(legacy)) return legacy;
+  return (await handle.exists(modern)) ? modern : legacy;
 }
 
 // usercache.json is re-read and re-parsed on every inventory read (the snapshot
@@ -85,13 +82,10 @@ function playerdataDir(serverId) {
 // servers can't grow it without bound.
 const usercacheCache = new Map();
 const USER_CACHE_MAX = 128;
-function usercacheMaps(serverId) {
-  let mtime = 0;
-  try {
-    mtime = fs.statSync(dataPath('servers', serverId, 'usercache.json')).mtimeMs;
-  } catch {
-    /* no usercache file yet */
-  }
+async function usercacheMaps(serverId) {
+  const handle = serverFs.for(serverId);
+  const st = await handle.statOrNull('usercache.json');
+  const mtime = st ? st.mtimeMs : 0;
   const hit = usercacheCache.get(serverId);
   if (hit && hit.mtime === mtime) {
     usercacheCache.delete(serverId);
@@ -101,8 +95,7 @@ function usercacheMaps(serverId) {
   const byUuid = new Map();
   const byName = new Map();
   try {
-    const raw = fs.readFileSync(dataPath('servers', serverId, 'usercache.json'), 'utf8');
-    const parsed = JSON.parse(raw);
+    const parsed = await handle.readJson('usercache.json');
     if (Array.isArray(parsed)) {
       for (const e of parsed) {
         if (!e || !e.uuid || !e.name) continue;
@@ -126,17 +119,16 @@ function usercacheMaps(serverId) {
  */
 async function readPlayerData(serverId, uuid) {
   uuid = assertUuid(uuid);
-  const file = path.join(playerdataDir(serverId), `${uuid}.dat`);
-  let stat;
-  try {
-    stat = await fsp.stat(file);
-  } catch {
+  const handle = serverFs.for(serverId);
+  const file = `${await playerdataDir(serverId)}/${uuid}.dat`;
+  const stat = await handle.statOrNull(file);
+  if (!stat) {
     throw httpError(404, 'No saved data for this player yet - they need to have joined the server at least once');
   }
 
   let data;
   try {
-    const buf = await fsp.readFile(file);
+    const buf = await handle.readFile(file);
     const { parsed } = await nbt.parse(buf); // handles gzip + endianness detection
     data = nbt.simplify(parsed);
   } catch {
@@ -181,7 +173,7 @@ async function readPlayerData(serverId, uuid) {
     };
   }
 
-  const { byUuid } = usercacheMaps(serverId);
+  const { byUuid } = await usercacheMaps(serverId);
   return {
     uuid,
     name: byUuid.get(uuid) || null,
@@ -210,26 +202,19 @@ function normalizeDimension(dim) {
 
 /** Every player with a playerdata file: [{uuid, name, lastModified}], newest first. */
 async function listPlayersWithData(serverId) {
-  const dir = playerdataDir(serverId);
-  let entries;
-  try {
-    entries = await fsp.readdir(dir, { withFileTypes: true });
-  } catch {
-    return []; // world not generated yet - nobody has joined
-  }
-  const { byUuid } = usercacheMaps(serverId);
+  const dir = await playerdataDir(serverId);
+  const entries = await serverFs
+    .for(serverId)
+    .readdir(dir)
+    .catch(() => null);
+  if (!entries) return []; // world not generated yet - nobody has joined
+  const { byUuid } = await usercacheMaps(serverId);
   const players = [];
   for (const e of entries) {
-    if (!e.isFile() || !e.name.endsWith('.dat')) continue; // skips .dat_old backups
+    if (e.dir || !e.name.endsWith('.dat')) continue; // skips .dat_old backups
     const uuid = e.name.slice(0, -4).toLowerCase();
     if (!UUID_RE.test(uuid)) continue;
-    let stat;
-    try {
-      stat = await fsp.stat(path.join(dir, e.name));
-    } catch {
-      continue;
-    }
-    players.push({ uuid, name: byUuid.get(uuid) || null, lastModified: stat.mtimeMs });
+    players.push({ uuid, name: byUuid.get(uuid) || null, lastModified: e.mtimeMs });
   }
   players.sort((a, b) => b.lastModified - a.lastModified);
   return players;
@@ -505,10 +490,11 @@ async function pollPlayerEventsInner() {
     lastEventId = Math.max(lastEventId, Number(row.id));
     if (!row.player || !NAME_RE.test(row.player)) continue;
     try {
-      const { byName } = usercacheMaps(row.server_id);
+      const { byName } = await usercacheMaps(row.server_id);
       const uuid = byName.get(row.player.toLowerCase());
       if (!uuid) continue; // never joined far enough to be cached
-      if (!fs.existsSync(path.join(playerdataDir(row.server_id), `${uuid}.dat`))) continue; // no .dat yet
+      const datRel = `${await playerdataDir(row.server_id)}/${uuid}.dat`;
+      if (!(await serverFs.for(row.server_id).exists(datRel))) continue; // no .dat yet
       await snapshot(row.server_id, uuid, row.type);
       await pruneSnapshots(row.server_id);
     } catch (err) {
@@ -659,7 +645,7 @@ function clampCount(count) {
 /** Who/where/how for an edit: player name, server state, chosen mechanism. */
 async function editContext(serverId, uuid) {
   uuid = assertUuid(uuid);
-  const { byUuid } = usercacheMaps(serverId);
+  const { byUuid } = await usercacheMaps(serverId);
   const name = byUuid.get(uuid) || null;
   let running = false;
   try {
@@ -701,8 +687,8 @@ async function flushPlayerData(serverId) {
 
 /** Read one slot straight from the .dat on disk (raw tree, no simplify). */
 async function readDatSlot(serverId, uuid, spec) {
-  const file = path.join(playerdataDir(serverId), `${uuid}.dat`);
-  const { parsed } = await nbt.parse(await fsp.readFile(file));
+  const file = `${await playerdataDir(serverId)}/${uuid}.dat`;
+  const { parsed } = await nbt.parse(await serverFs.for(serverId).readFile(file));
   const cur = offlineSlotRef(parsed.value, spec).get();
   if (!cur) return { exists: false };
   return {
@@ -1026,23 +1012,20 @@ function applyOfflineNestedEdit(root, spec, { path: pathSegs, index, op, item, c
 const BAK_SUFFIX = '.msm-bak-';
 const BAK_KEEP = 3;
 
-async function backupDat(file) {
+async function backupDat(handle, file) {
   const bak = `${file}${BAK_SUFFIX}${Date.now()}`;
-  await fsp.copyFile(file, bak);
-  const dir = path.dirname(file);
-  const prefix = path.basename(file) + BAK_SUFFIX;
-  let names;
-  try {
-    names = await fsp.readdir(dir);
-  } catch {
-    return bak;
-  }
-  const baks = names
+  await handle.copy(file, bak);
+  const dir = file.slice(0, file.lastIndexOf('/'));
+  const prefix = `${file.slice(file.lastIndexOf('/') + 1)}${BAK_SUFFIX}`;
+  const entries = await handle.readdir(dir).catch(() => null);
+  if (!entries) return bak;
+  const baks = entries
+    .map((e) => e.name)
     .filter((n) => n.startsWith(prefix))
     .sort()
     .reverse();
   for (const old of baks.slice(BAK_KEEP)) {
-    await fsp.rm(path.join(dir, old), { force: true }).catch(() => {});
+    await handle.remove(`${dir}/${old}`).catch(() => {});
   }
   return bak;
 }
@@ -1064,13 +1047,14 @@ async function withDatFile(serverId, ctx, mutate) {
       `${ctx.name || ctx.uuid} is online - the server would overwrite file edits. This edit should have gone over RCON; reload and retry.`
     );
   }
-  const file = path.join(playerdataDir(serverId), `${ctx.uuid}.dat`);
+  const handle = serverFs.for(serverId);
+  const file = `${await playerdataDir(serverId)}/${ctx.uuid}.dat`;
   // Serialize edits to the same .dat: two concurrent slot edits sharing one temp
   // path could interleave their writes and corrupt the save.
-  return withDatLock(file, async () => {
+  return withDatLock(`${serverId}/${file}`, async () => {
     let buf;
     try {
-      buf = await fsp.readFile(file);
+      buf = await handle.readFile(file);
     } catch {
       throw httpError(404, 'No saved data for this player yet - they need to have joined the server at least once');
     }
@@ -1081,14 +1065,14 @@ async function withDatFile(serverId, ctx, mutate) {
       throw httpError(422, "That player's saved data could not be read. It may be from an incompatible version.");
     }
     const result = mutate(parsed.value);
-    await backupDat(file);
+    await backupDat(handle, file);
     // gzip off the event loop: serializing a full inventory NBT can spend
     // 50-200ms in zlib, so use the promise API instead of the blocking gzipSync.
     // (`zlib.gzip` itself is callback-only and throws without one.)
     const out = await gzipAsync(nbt.writeUncompressed(parsed, 'big')); // playerdata is always gzip'd big-endian
     const tmp = `${file}.msm-tmp-${process.pid}-${require('node:crypto').randomUUID()}`;
-    await fsp.writeFile(tmp, out);
-    await fsp.rename(tmp, file);
+    await handle.writeFile(tmp, out);
+    await handle.rename(tmp, file);
     return result;
   });
 }

@@ -5,12 +5,11 @@
 // timelines ("time query day"); ≤1.21 uses camelCase + "time query daytime".
 // Every op tries the modern form first and falls back to legacy.
 
-const fs = require('node:fs');
 const nbt = require('prismarine-nbt');
 const { execCapture } = require('../docker/containers');
 const { cleanText } = require('../utils/ansi');
 const { recordEvent } = require('../events');
-const { dataPath } = require('../storage/pathGuard');
+const serverFs = require('../storage/serverFs');
 const servers = require('./servers');
 
 // camelCase (≤1.21) -> snake_case (26.x). Every op tries the snake_case form
@@ -304,18 +303,20 @@ async function queryDifficulty(serverId) {
 // file edit sticks. Vanilla default is on (pvp=true). There is no vanilla live+
 // permanent global switch - that needs a server mod/plugin (e.g. Essential)
 // with engine access.
-function readPvp(serverId) {
+async function readPvp(serverId) {
   try {
-    const text = fs.readFileSync(dataPath('servers', serverId, 'server.properties'), 'utf8');
-    const m = /^pvp=(.*)$/m.exec(text);
-    return m ? m[1].trim() !== 'false' : true;
+    // Shares worlds.readProps' cached parse: half the server page reads this
+    // same file, and on a remote host each read is a round trip.
+    const props = await require('./worlds').readProps(serverId);
+    const raw = props.get('pvp');
+    return raw === undefined ? true : String(raw).trim() !== 'false';
   } catch {
     return true; // fresh server - vanilla default
   }
 }
 
-function writePvp(serverId, on, { actor = 'system' } = {}) {
-  servers.setServerProperty(serverId, 'pvp', String(on), { actor });
+async function writePvp(serverId, on, { actor = 'system' } = {}) {
+  await servers.setServerProperty(serverId, 'pvp', String(on), { actor });
 }
 
 // A running getState() is ~1 + N sequential `docker exec rcon-cli` round trips
@@ -406,7 +407,7 @@ async function readStateLive(serverId, opts = {}) {
   if (unsupported.length) state.unsupported = unsupported;
   const difficulty = await queryDifficulty(serverId).catch(() => null);
   if (difficulty) state.difficulty = difficulty;
-  state.pvp = readPvp(serverId); // from server.properties - the pending/effective value
+  state.pvp = await readPvp(serverId); // from server.properties - the pending/effective value
   return state;
 }
 
@@ -421,10 +422,9 @@ function longToNum(v) {
 async function readActiveLevelData(serverId) {
   const server = require('./servers').getServer(serverId);
   if (!server) return null;
-  const level = require('./worlds').activeLevelName(server);
-  const file = dataPath('servers', serverId, level, 'level.dat');
+  const level = await require('./worlds').activeLevelName(server);
   try {
-    const { parsed } = await nbt.parse(await fs.promises.readFile(file));
+    const { parsed } = await nbt.parse(await serverFs.for(serverId).readFile(`${level}/level.dat`));
     const s = nbt.simplify(parsed);
     return s.Data || s;
   } catch {
@@ -488,7 +488,7 @@ function offlineStateFromLevelData(data, opts = {}) {
 // (the <fieldset> is disabled), so this never writes.
 async function getStateOffline(serverId, opts = {}) {
   const data = await readActiveLevelData(serverId);
-  return { ...offlineStateFromLevelData(data, opts), pvp: readPvp(serverId) };
+  return { ...offlineStateFromLevelData(data, opts), pvp: await readPvp(serverId) };
 }
 
 async function runQuick(serverId, action, { actor = 'system' } = {}) {
@@ -532,7 +532,7 @@ async function runQuick(serverId, action, { actor = 'system' } = {}) {
 
   // server.properties edit - not an RCON command, nothing to verify.
   if (quick.prop === 'pvp') {
-    writePvp(serverId, quick.value, { actor }); // also un-sets the PVP env var
+    await writePvp(serverId, quick.value, { actor }); // also un-sets the PVP env var
     return ok('');
   }
 
@@ -559,7 +559,7 @@ async function runQuick(serverId, action, { actor = 'system' } = {}) {
   // `persist`): the command only changes the running world, and a dedicated
   // server re-applies the property on every boot. Writing it through the
   // choke point also un-sets the env var that would otherwise re-assert it.
-  if (quick.persist) servers.setServerProperty(serverId, quick.persist, quick.cmd[1], { actor });
+  if (quick.persist) await servers.setServerProperty(serverId, quick.persist, quick.cmd[1], { actor });
   return ok(out);
 }
 
